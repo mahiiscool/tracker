@@ -188,6 +188,13 @@ const INCREMENTS = {
 const DEFAULT_INCREMENT = 5;
 
 const DAY_ORDER = ['mon', 'wed', 'fri'];
+// The training days. Mahi's plan by default, or whatever a new person sets up.
+async function getDays() {
+  const d = await getSetting('days', null);
+  if (d && d.length) return d;
+  return DAY_ORDER.map((k) => ({ key: k, title: PLAN[k].title, subtitle: PLAN[k].subtitle }));
+}
+
 const DAY_NAMES = { mon: 'Monday', tue: 'Tuesday', wed: 'Wednesday', thu: 'Thursday', fri: 'Friday', sat: 'Saturday', sun: 'Sunday' };
 
 const PRESETS = [
@@ -299,7 +306,7 @@ async function migratePlan() {
   await setSetting('planVersion', PLAN_VERSION);
 }
 
-return { PLAN, HISTORY, DAY_ORDER, DAY_NAMES, PRESETS, NUTRITION, PLAN_VERSION, buildPlan, seedIfEmpty, migratePlan };
+return { PLAN, HISTORY, DAY_ORDER, getDays, DAY_NAMES, PRESETS, NUTRITION, PLAN_VERSION, buildPlan, seedIfEmpty, migratePlan };
 })();
 
 /* ===== js/progression.js ===== */
@@ -601,14 +608,15 @@ async function ensureWeekTargets(ws = weekStart()) {
   if (!missing.length) return;
 
   const rule = await getRule();
-  const { bySlot } = await loadHistory();
+  const { byExercise } = await loadHistory();
   const prevWeek = addDays(ws, -7);
   const allRows = await getAll('weeklyTargets');
   const out = [];
 
   for (const slot of missing) {
     const ex = exercises.get(slot.exerciseId);
-    const hist = (bySlot.get(slot.id) || []).filter((h) => !h.session.imported && h.session.date);
+    // History is per exercise, so every day an exercise appears gets the same weight.
+    const hist = (byExercise.get(slot.exerciseId) || []).filter((h) => !h.session.imported && h.session.date);
     const lastWeek = hist.filter((h) => weekStart(parseDate(h.session.date)) === prevWeek);
     const last = lastWeek[lastWeek.length - 1];
     let t;
@@ -630,7 +638,24 @@ async function ensureWeekTargets(ws = weekStart()) {
 }
 
 // Manual override. What he types is what gets saved.
-async function saveTarget(ws, slot, { targetWeight, targetReps }) {
+async function siblingSlots(slot) {
+  return (await getAll('planSlots')).filter((s) => s.exerciseId === slot.exerciseId && s.id !== slot.id);
+}
+
+// After a session, the other days of the same exercise take the weight you actually used.
+async function syncWeightToSiblings(exerciseId, weight, ws, exceptSlotId) {
+  if (await isBaselineWeek(ws)) return;
+  const slots = (await getAll('planSlots')).filter((s) => s.exerciseId === exerciseId && s.id !== exceptSlotId);
+  const rows = await weekTargets(ws);
+  for (const s of slots) {
+    const r = rows.get(s.id);
+    if (r && r.targetWeight !== weight) {
+      await put('weeklyTargets', { ...r, targetWeight: weight, note: 'Matched to your other day' });
+    }
+  }
+}
+
+async function saveTarget(ws, slot, { targetWeight, targetReps }, applyToOthers = false) {
   const rows = await getAllByIndex('weeklyTargets', 'weekStart', ws);
   const old = rows.find((r) => r.slotId === slot.id);
   const reps = targetReps && targetReps.some((r) => r > 0) ? targetReps : null;
@@ -647,6 +672,17 @@ async function saveTarget(ws, slot, { targetWeight, targetReps }) {
     overridden: true,
   };
   await put('weeklyTargets', row);
+  if (applyToOthers) {
+    for (const sib of await siblingSlots(slot)) {
+      const old2 = rows.find((r) => r.slotId === sib.id);
+      const reps2 = reps ? Array.from({ length: sib.sets }, (_, i) => reps[i] ?? reps[reps.length - 1]) : null;
+      await put('weeklyTargets', {
+        ...(old2 || {}), weekStart: ws, slotId: sib.id, exerciseId: sib.exerciseId,
+        targetWeight, targetReps: reps2, totalRepGoal: reps2 ? reps2.reduce((a, b) => a + b, 0) : null,
+        suggestion: null, note: 'Edited by you', overridden: true,
+      });
+    }
+  }
   return row;
 }
 
@@ -659,7 +695,7 @@ function targetText(row, slot, ex) {
   return w ? `${w}, ${reps}` : reps;
 }
 
-return { loadPlan, loadHistory, weekTargets, isBaselineWeek, getRule, ensureWeekTargets, saveTarget, targetText };
+return { loadPlan, loadHistory, weekTargets, isBaselineWeek, getRule, ensureWeekTargets, siblingSlots, syncWeightToSiblings, saveTarget, targetText };
 })();
 
 /* ===== js/stats.js ===== */
@@ -765,6 +801,330 @@ async function liftData() {
 }
 
 return { dailyWeights, avgWindow, movingAvg, waistEntries, targetFor, foodTotals, liftData };
+})();
+
+/* ===== js/autotargets.js ===== */
+__m['js/autotargets.js'] = (function () {
+// Targets that follow body weight, without touching your goals.
+//
+// Protein: target = ratio x body weight, where the ratio is your own current target divided by
+// your current weight (for example 160 g / 182 lb = 0.88 g per lb). It moves in steps of 5 g, at most
+// once a week, and never leaves 0.75 to 1.1 g per lb.
+//
+// Calories: OFF by default. Your check in already adds or removes calories from the weight and waist
+// trend. Scaling calories with weight at the same time would fight it, because the check in adds
+// calories exactly when your weight drops.
+const { getSetting, setSetting, put, remove, dateStr } = __m['js/db.js'];
+const { dailyWeights, targetFor } = __m['js/stats.js'];
+const { addDays, diffDays, mean } = __m['js/ui.js'];
+
+const r5 = (x) => Math.round(x / 5) * 5;
+const r50 = (x) => Math.round(x / 50) * 50;
+const r1 = (x) => Math.round(x * 10) / 10;
+
+const SETTINGS = { autoProtein: true, autoKcal: false };
+
+// Average of the last 7 days, only when there are at least 3 weigh ins in that window.
+async function steadyWeight(today = dateStr()) {
+  const daily = await dailyWeights();
+  const recent = daily.filter((d) => d.date >= addDays(today, -6) && d.date <= today);
+  return recent.length >= 3 ? mean(recent.map((d) => d.lb)) : null;
+}
+
+// Call after you change a target on purpose. The new numbers become the ratio to follow.
+async function rebaseline(today = dateStr()) {
+  const w = await steadyWeight(today);
+  if (!w) { await remove('settings', 'proteinPerLb'); await remove('settings', 'kcalPerLb'); return; }
+  const t = await targetFor(today);
+  await setSetting('proteinPerLb', t.protein / w);
+  await setSetting('kcalPerLb', t.kcal / w);
+  await setSetting('autoLast', today);
+}
+
+async function maybeAutoAdjust(today = dateStr()) {
+  const autoProtein = await getSetting('autoProtein', SETTINGS.autoProtein);
+  const autoKcal = await getSetting('autoKcal', SETTINGS.autoKcal);
+  if (!autoProtein && !autoKcal) return null;
+  const w = await steadyWeight(today);
+  if (!w) return null;
+  const t = await targetFor(today);
+
+  const ppl = await getSetting('proteinPerLb', null);
+  const kpl = await getSetting('kcalPerLb', null);
+  if (ppl === null || kpl === null) { await rebaseline(today); return null; }
+
+  const last = await getSetting('autoLast', null);
+  if (last && diffDays(last, today) < 7) return null;
+  await setSetting('autoLast', today);
+
+  let protein = t.protein;
+  let kcal = t.kcal;
+  if (autoProtein) {
+    const p = Math.min(Math.max(r5(ppl * w), Math.round(0.75 * w)), Math.round(1.1 * w));
+    if (Math.abs(p - t.protein) >= 5) protein = p;
+  }
+  if (autoKcal) {
+    const k = r50(kpl * w);
+    if (Math.abs(k - t.kcal) >= 50) kcal = k;
+  }
+  if (protein === t.protein && kcal === t.kcal) return null;
+
+  const carbs = Math.max(0, Math.round((kcal - protein * 4 - t.fat * 9) / 4));
+  await put('nutritionTargets', {
+    effectiveDate: today, kcal, protein, fat: t.fat, carbs, reason: `Auto, body weight ${r1(w)} lb`,
+  });
+  const change = { date: today, weight: r1(w), from: { kcal: t.kcal, protein: t.protein, fat: t.fat, carbs: t.carbs }, to: { kcal, protein } };
+  await setSetting('autoUndo', change);
+  return change;
+}
+
+// Put the old numbers back and stop following weight.
+async function undoAuto(today = dateStr()) {
+  const c = await getSetting('autoUndo', null);
+  if (!c) return;
+  await put('nutritionTargets', { effectiveDate: today, ...c.from, reason: 'Undo auto change' });
+  await setSetting('autoProtein', false);
+  await setSetting('autoKcal', false);
+  await remove('settings', 'autoUndo');
+}
+
+async function dismissAuto() { await remove('settings', 'autoUndo'); }
+
+return { SETTINGS, steadyWeight, rebaseline, maybeAutoAdjust, undoAuto, dismissAuto };
+})();
+
+/* ===== js/backup.js ===== */
+__m['js/backup.js'] = (function () {
+// Export, import and CSV. Everything lives on this phone, so a backup file is the safety net.
+const { PLAN_VERSION } = __m['js/seed.js'];
+const { getAll, clear, remove, putMany, getSetting, setSetting, dateStr, STORE_NAMES } = __m['js/db.js'];
+
+const blobToDataUrl = (blob) => new Promise((res, rej) => {
+  const r = new FileReader();
+  r.onload = () => res(r.result);
+  r.onerror = () => rej(r.error);
+  r.readAsDataURL(blob);
+});
+const dataUrlToBlob = async (url) => (await fetch(url)).blob();
+
+async function exportAll() {
+  const out = { app: 'tracker', version: 1, exportedAt: new Date().toISOString(), stores: {} };
+  for (const name of STORE_NAMES) {
+    const rows = await getAll(name);
+    if (name === 'photos') {
+      out.stores.photos = [];
+      for (const p of rows) out.stores.photos.push({ ...p, blob: p.blob ? await blobToDataUrl(p.blob) : null });
+    } else {
+      out.stores[name] = rows;
+    }
+  }
+  return out;
+}
+
+function countsOf(data) {
+  const o = {};
+  for (const [k, v] of Object.entries(data.stores || {})) o[k] = v.length;
+  return o;
+}
+
+async function importAll(data) {
+  if (!data || data.app !== 'tracker' || !data.stores) throw new Error('This is not a tracker backup file.');
+  for (const name of STORE_NAMES) {
+    await clear(name);
+    let rows = data.stores[name] || [];
+    if (name === 'photos') {
+      rows = await Promise.all(rows.map(async (p) => ({ ...p, blob: p.blob ? await dataUrlToBlob(p.blob) : null })));
+    }
+    if (rows.length) await putMany(name, rows);
+  }
+}
+
+// Clears the logs you pick. The plan, exercises, presets and settings stay.
+// The two history entries you gave me at the start (imported) are real, so they stay too.
+async function resetProgress(o) {
+  if (o.workouts) {
+    const sessions = await getAll('sessions');
+    const keep = new Set(sessions.filter((s) => s.imported).map((s) => s.id));
+    for (const s of sessions) if (!s.imported) await remove('sessions', s.id);
+    for (const r of await getAll('sets')) if (!keep.has(r.sessionId)) await remove('sets', r.id);
+    await clear('weeklyTargets');
+    await remove('settings', 'baselineWeek');
+  }
+  if (o.weight) {
+    await clear('weights'); await clear('waist');
+    for (const k of ['proteinPerLb', 'kcalPerLb', 'autoLast', 'autoUndo']) await remove('settings', k);
+  }
+  if (o.food) {
+    await clear('foodEntries');
+    for (const r of await getAll('settings')) {
+      if (r.key.startsWith('water:') || r.key.startsWith('carbPortion:')) await remove('settings', r.key);
+    }
+  }
+  if (o.checkins) {
+    await clear('checkIns');
+    for (const r of await getAll('nutritionTargets')) if ((r.reason || '').startsWith('Check in')) await remove('nutritionTargets', r.id);
+  }
+  if (o.photos) await clear('photos');
+}
+
+async function resetAll() {
+  for (const name of STORE_NAMES) await clear(name);
+}
+
+function csvCell(v) {
+  if (v === null || v === undefined) return '';
+  const s = typeof v === 'object' ? JSON.stringify(v) : String(v);
+  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
+async function csvOf(store) {
+  const rows = await getAll(store);
+  const cols = [...new Set(rows.flatMap((r) => Object.keys(r)))].filter((c) => c !== 'blob');
+  return [cols.join(','), ...rows.map((r) => cols.map((c) => csvCell(r[c])).join(','))].join('\n');
+}
+
+// Share sheet when the phone supports sharing files (Files app, iCloud Drive), otherwise a download.
+async function shareOrDownload(filename, text, type) {
+  const file = new File([text], filename, { type });
+  if (navigator.canShare && navigator.canShare({ files: [file] })) {
+    try {
+      await navigator.share({ files: [file], title: filename });
+      return 'shared';
+    } catch (e) {
+      if (e && e.name === 'AbortError') return 'cancelled';
+    }
+  }
+  const url = URL.createObjectURL(file);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
+  return 'downloaded';
+}
+
+async function exportJsonFile() {
+  const data = await exportAll();
+  const result = await shareOrDownload(`tracker-backup-${dateStr()}.json`, JSON.stringify(data), 'application/json');
+  if (result !== 'cancelled') await setSetting('lastExport', dateStr());
+  return result;
+}
+
+// Backup reminder: true when the last export (or first use) is 7 or more days ago.
+async function backupDue() {
+  let base = await getSetting('lastExport', null);
+  if (!base) {
+    base = await getSetting('installedAt', null);
+    if (!base) { await setSetting('installedAt', dateStr()); return false; }
+  }
+  const a = new Date(base + 'T00:00:00');
+  return (Date.now() - a.getTime()) / 86400000 >= 7;
+}
+
+// "I'm not Mahi": wipe this phone and start the setup screen for someone else.
+async function startFriendSetup() {
+  await resetAll();
+  await setSetting('seeded', true);
+  await setSetting('planVersion', PLAN_VERSION);
+  await setSetting('moveUpRule', 'first');
+  await setSetting('restTimerSeconds', 90);
+  await setSetting('needsSetup', true);
+}
+
+return { exportAll, countsOf, importAll, resetProgress, resetAll, csvOf, shareOrDownload, exportJsonFile, backupDue, startFriendSetup };
+})();
+
+/* ===== js/screens/setup.js ===== */
+__m['js/screens/setup.js'] = (function () {
+// First time setup for someone else ("I'm not Mahi"): name, training days, targets.
+const { put, getSetting, setSetting, dateStr } = __m['js/db.js'];
+const { openSheet, esc } = __m['js/ui.js'];
+const { startFriendSetup } = __m['js/backup.js'];
+
+const WEEK = [
+  ['mon', 'Monday'], ['tue', 'Tuesday'], ['wed', 'Wednesday'], ['thu', 'Thursday'],
+  ['fri', 'Friday'], ['sat', 'Saturday'], ['sun', 'Sunday'],
+];
+
+// Warning sheet. Nothing is erased until RESET is typed.
+function friendSetupSheet() {
+  const { root, close } = openSheet(`
+    <h2>Set this up for someone else?</h2>
+    <div class="muted small" style="line-height:1.45">This erases everything on this phone: the plan, workouts, weigh ins, food and photos. If this is your own phone, export a backup first from Settings. A friend using their own phone has nothing of yours on it, so they can go ahead.</div>
+    <label class="field">Type RESET to continue<input id="n-word" autocapitalize="characters" placeholder="RESET"></label>
+    <button class="btn" data-act="go" style="background:#FBBF24;color:#2b2000">Erase and start setup</button>
+    <button class="btn secondary" data-act="cancel">Cancel</button>`);
+  root.addEventListener('click', async (e) => {
+    const act = e.target.closest('[data-act]')?.dataset.act;
+    if (act === 'cancel') return close();
+    if (act !== 'go') return;
+    if (root.querySelector('#n-word').value.trim() !== 'RESET') return root.querySelector('#n-word').classList.add('shake');
+    await startFriendSetup();
+    close();
+    location.hash = '#/setup';
+    location.reload();
+  });
+}
+
+async function render(el) {
+  if (!(await getSetting('needsSetup', false))) { location.hash = '#/today'; return; }
+  el.innerHTML = `
+    <div class="header"><h1>Welcome</h1></div>
+    <p class="sub">A quick setup. You can change all of it later in Settings.</p>
+
+    <div class="card">
+      <h3>Your name</h3>
+      <input id="s-name" placeholder="Optional" style="width:100%">
+    </div>
+
+    <div class="card">
+      <h3>Training days</h3>
+      <div class="small muted">Tick the days you lift and name each one, like Push or Legs.</div>
+      ${WEEK.map(([k, n], i) => `
+        <div class="dayrow">
+          <label class="check-line" style="margin:0"><input type="checkbox" data-day="${k}" ${['mon', 'wed', 'fri'].includes(k) ? 'checked' : ''}> ${n.slice(0, 3)}</label>
+          <input type="text" data-title="${k}" placeholder="Name, optional">
+        </div>`).join('')}
+    </div>
+
+    <div class="card">
+      <h3>Daily targets</h3>
+      <div class="grid2">
+        <label class="field" style="margin-top:0">Calories<input id="s-kcal" inputmode="numeric" placeholder="kcal"></label>
+        <label class="field" style="margin-top:0">Protein g<input id="s-pro" inputmode="numeric" placeholder="g"></label>
+      </div>
+      <div class="small muted" style="margin-top:8px;line-height:1.45">Not sure? A common protein target is about 0.7 to 1 g per pound of body weight. You can change these any time.</div>
+    </div>
+
+    <div class="card"><div class="small muted" style="line-height:1.45">Your plan starts empty. After this, open Settings and use Add exercise on each day to build it. Weights are in pounds.</div></div>
+    <button class="btn" data-act="finish">Finish setup</button>`;
+
+  el.onclick = async (e) => {
+    if (e.target.closest('[data-act]')?.dataset.act !== 'finish') return;
+    const kcal = parseInt(el.querySelector('#s-kcal').value, 10);
+    const protein = parseInt(el.querySelector('#s-pro').value, 10);
+    const keys = [...el.querySelectorAll('[data-day]')].filter((c) => c.checked).map((c) => c.dataset.day);
+    if (!keys.length) return alert('Pick at least one training day.');
+    if (!(kcal > 0) || !(protein > 0)) {
+      (!(kcal > 0) ? el.querySelector('#s-kcal') : el.querySelector('#s-pro')).classList.add('shake');
+      return;
+    }
+    const days = keys.map((k, i) => ({
+      key: k,
+      title: el.querySelector(`[data-title="${k}"]`).value.trim() || `Workout ${i + 1}`,
+      subtitle: '',
+    }));
+    const fat = Math.round((kcal * 0.28) / 9);
+    const carbs = Math.max(0, Math.round((kcal - protein * 4 - fat * 9) / 4));
+    await put('nutritionTargets', { effectiveDate: dateStr(), kcal, protein, fat, carbs, reason: 'Setup' });
+    await setSetting('days', days);
+    await setSetting('userName', el.querySelector('#s-name').value.trim());
+    await setSetting('needsSetup', false);
+    location.hash = '#/today';
+    location.reload();
+  };
+}
+
+return { friendSetupSheet, render };
 })();
 
 /* ===== js/charts.js ===== */
@@ -1044,6 +1404,7 @@ __m['js/checkin.js'] = (function () {
 // Check in every 14 days: compares weight, waist and lifts, then suggests a calorie change.
 const { getAll, put, dateStr } = __m['js/db.js'];
 const { addDays, diffDays } = __m['js/ui.js'];
+const { rebaseline } = __m['js/autotargets.js'];
 const { dailyWeights, avgWindow, waistEntries, targetFor, liftData } = __m['js/stats.js'];
 
 const RULES = {
@@ -1151,6 +1512,7 @@ async function applyDelta(c, delta) {
     effectiveDate: c.date, kcal, protein: t.protein, fat: t.fat, carbs,
     reason: `Check in ${delta > 0 ? '+' : ''}${delta} kcal`,
   });
+  await rebaseline(c.date);
 }
 
 async function saveCheckIn(c, applied, delta = null) {
@@ -1161,107 +1523,6 @@ async function saveCheckIn(c, applied, delta = null) {
 }
 
 return { RULES, checkInStatus, computeCheckIn, applyDelta, saveCheckIn };
-})();
-
-/* ===== js/backup.js ===== */
-__m['js/backup.js'] = (function () {
-// Export, import and CSV. Everything lives on this phone, so a backup file is the safety net.
-const { getAll, clear, putMany, getSetting, setSetting, dateStr, STORE_NAMES } = __m['js/db.js'];
-
-const blobToDataUrl = (blob) => new Promise((res, rej) => {
-  const r = new FileReader();
-  r.onload = () => res(r.result);
-  r.onerror = () => rej(r.error);
-  r.readAsDataURL(blob);
-});
-const dataUrlToBlob = async (url) => (await fetch(url)).blob();
-
-async function exportAll() {
-  const out = { app: 'tracker', version: 1, exportedAt: new Date().toISOString(), stores: {} };
-  for (const name of STORE_NAMES) {
-    const rows = await getAll(name);
-    if (name === 'photos') {
-      out.stores.photos = [];
-      for (const p of rows) out.stores.photos.push({ ...p, blob: p.blob ? await blobToDataUrl(p.blob) : null });
-    } else {
-      out.stores[name] = rows;
-    }
-  }
-  return out;
-}
-
-function countsOf(data) {
-  const o = {};
-  for (const [k, v] of Object.entries(data.stores || {})) o[k] = v.length;
-  return o;
-}
-
-async function importAll(data) {
-  if (!data || data.app !== 'tracker' || !data.stores) throw new Error('This is not a tracker backup file.');
-  for (const name of STORE_NAMES) {
-    await clear(name);
-    let rows = data.stores[name] || [];
-    if (name === 'photos') {
-      rows = await Promise.all(rows.map(async (p) => ({ ...p, blob: p.blob ? await dataUrlToBlob(p.blob) : null })));
-    }
-    if (rows.length) await putMany(name, rows);
-  }
-}
-
-async function resetAll() {
-  for (const name of STORE_NAMES) await clear(name);
-}
-
-function csvCell(v) {
-  if (v === null || v === undefined) return '';
-  const s = typeof v === 'object' ? JSON.stringify(v) : String(v);
-  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-}
-
-async function csvOf(store) {
-  const rows = await getAll(store);
-  const cols = [...new Set(rows.flatMap((r) => Object.keys(r)))].filter((c) => c !== 'blob');
-  return [cols.join(','), ...rows.map((r) => cols.map((c) => csvCell(r[c])).join(','))].join('\n');
-}
-
-// Share sheet when the phone supports sharing files (Files app, iCloud Drive), otherwise a download.
-async function shareOrDownload(filename, text, type) {
-  const file = new File([text], filename, { type });
-  if (navigator.canShare && navigator.canShare({ files: [file] })) {
-    try {
-      await navigator.share({ files: [file], title: filename });
-      return 'shared';
-    } catch (e) {
-      if (e && e.name === 'AbortError') return 'cancelled';
-    }
-  }
-  const url = URL.createObjectURL(file);
-  const a = document.createElement('a');
-  a.href = url; a.download = filename;
-  document.body.appendChild(a); a.click(); a.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 5000);
-  return 'downloaded';
-}
-
-async function exportJsonFile() {
-  const data = await exportAll();
-  const result = await shareOrDownload(`tracker-backup-${dateStr()}.json`, JSON.stringify(data), 'application/json');
-  if (result !== 'cancelled') await setSetting('lastExport', dateStr());
-  return result;
-}
-
-// Backup reminder: true when the last export (or first use) is 7 or more days ago.
-async function backupDue() {
-  let base = await getSetting('lastExport', null);
-  if (!base) {
-    base = await getSetting('installedAt', null);
-    if (!base) { await setSetting('installedAt', dateStr()); return false; }
-  }
-  const a = new Date(base + 'T00:00:00');
-  return (Date.now() - a.getTime()) / 86400000 >= 7;
-}
-
-return { exportAll, countsOf, importAll, resetAll, csvOf, shareOrDownload, exportJsonFile, backupDue };
 })();
 
 /* ===== js/photos.js ===== */
@@ -1303,8 +1564,10 @@ return { photoUrl, savePhoto };
 
 /* ===== js/screens/today.js ===== */
 __m['js/screens/today.js'] = (function () {
-const { getAll, getAllByIndex, dayKey, dateStr, weekStart, parseDate } = __m['js/db.js'];
-const { PLAN, DAY_ORDER, DAY_NAMES } = __m['js/seed.js'];
+const { getAll, getAllByIndex, getSetting, dayKey, dateStr, weekStart, parseDate } = __m['js/db.js'];
+const { getDays, DAY_NAMES } = __m['js/seed.js'];
+const { maybeAutoAdjust, undoAuto, dismissAuto } = __m['js/autotargets.js'];
+const { friendSetupSheet } = __m['js/screens/setup.js'];
 const { ensureWeekTargets, weekTargets, isBaselineWeek, loadPlan } = __m['js/targets.js'];
 const { dailyWeights, waistEntries, targetFor } = __m['js/stats.js'];
 const { weighInHtml, saveWeighIn } = __m['js/screens/weight.js'];
@@ -1315,13 +1578,13 @@ const { esc } = __m['js/ui.js'];
 
 const GEAR = `<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>`;
 
-function nextTrainingDay(from) {
+function nextTrainingDay(from, keys) {
   for (let i = 1; i <= 7; i++) {
     const d = new Date(from.getFullYear(), from.getMonth(), from.getDate() + i);
     const k = dayKey(d);
-    if (PLAN[k]) return k;
+    if (keys.includes(k)) return k;
   }
-  return DAY_ORDER[0];
+  return keys[0];
 }
 
 async function render(el) {
@@ -1331,6 +1594,10 @@ async function render(el) {
   const long = now.toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric' });
   const ws = weekStart(now);
   await ensureWeekTargets(ws);
+  await maybeAutoAdjust(today);
+  const days = await getDays();
+  const dmap = new Map(days.map((d) => [d.key, d]));
+  const userName = await getSetting('userName', '');
 
   const { slots: allSlots } = await loadPlan();
   const baseline = await isBaselineWeek(ws);
@@ -1342,28 +1609,31 @@ async function render(el) {
 
   // Workout card
   let workout;
-  if (PLAN[key]) {
+  const info = dmap.get(key);
+  if (info) {
     const n = allSlots.filter((s) => s.day === key).length;
     const sessions = (await getAll('sessions')).filter((s) =>
       !s.imported && s.day === key && (s.date === today || (!s.finishedAt && s.weekStart === ws)));
     const sess = sessions.sort((a, b) => a.id - b.id).pop();
-    const label = !sess ? 'Start workout' : sess.finishedAt ? 'View summary' : 'Resume';
+    const label = !n ? 'Add exercises' : !sess ? 'Start workout' : sess.finishedAt ? 'View summary' : 'Resume';
+    const href = n ? `#/workout/${key}` : '#/settings';
     workout = `
       <div class="card">
         <h3>Today's workout</h3>
-        <h2>${PLAN[key].title}</h2>
-        <div class="muted">${PLAN[key].subtitle}</div>
+        <h2>${esc(info.title)}</h2>
+        <div class="muted">${esc(info.subtitle || '')}</div>
         <div class="small muted" style="margin-top:8px">${n} exercises. ${weekLine}.</div>
-        <a class="btn" href="#/workout/${key}" style="text-decoration:none;text-align:center;line-height:52px">${label}</a>
+        <a class="btn" href="${href}" style="text-decoration:none;text-align:center;line-height:52px">${label}</a>
       </div>`;
   } else {
-    const next = nextTrainingDay(now);
+    const next = nextTrainingDay(now, days.map((d) => d.key));
+    const ninfo = dmap.get(next);
     const n = allSlots.filter((s) => s.day === next).length;
     workout = `
       <div class="card">
         <h3>Today</h3>
         <h2>Rest day</h2>
-        <div class="muted" style="margin-top:6px">Next up: ${DAY_NAMES[next]}, ${PLAN[next].title} (${n} exercises)</div>
+        <div class="muted" style="margin-top:6px">Next up: ${DAY_NAMES[next]}, ${esc(ninfo.title)} (${n} exercises)</div>
         <div class="small muted" style="margin-top:6px">${weekLine}.</div>
         <a class="btn secondary" href="#/workout" style="text-decoration:none;text-align:center;line-height:52px">See this week</a>
       </div>`;
@@ -1389,6 +1659,16 @@ async function render(el) {
 
   // Banners and prompts
   const banners = [];
+  const auto = await getSetting('autoUndo', null);
+  if (auto) {
+    const parts = [];
+    if (auto.to.protein !== auto.from.protein) parts.push(`protein ${auto.from.protein} to ${auto.to.protein} g`);
+    if (auto.to.kcal !== auto.from.kcal) parts.push(`calories ${auto.from.kcal} to ${auto.to.kcal}`);
+    banners.push(`<div class="card"><h3>Targets updated</h3>
+      <div>Your weight is about ${auto.weight} lb, so your ${parts.join(' and ')}. Same ratio as before.</div>
+      <button class="btn secondary" data-act="autook">Got it</button>
+      <button class="btn secondary" data-act="autoundo" style="color:#FBBF24">Undo and stop following my weight</button></div>`);
+  }
   if (await backupDue()) {
     banners.push(`<div class="card"><h3>Backup</h3><div>It has been a week since your last backup.</div>
       <button class="btn secondary" data-act="backup">Back up now</button></div>`);
@@ -1427,11 +1707,12 @@ async function render(el) {
       <h1>Today</h1>
       <a class="icon-btn" href="#/settings" aria-label="Settings">${GEAR}</a>
     </div>
-    <p class="sub">${long}</p>
+    <p class="sub">${userName ? `Hi ${esc(userName)}. ` : ''}${long}</p>
     ${weigh}
     ${banners.join('')}
     ${workout}
     ${food}
+    <button class="link notme" data-act="notme">${!userName || userName === 'Mahi' ? "I'm not Mahi" : 'Set up for someone else'}</button>
   `;
 
   el.onclick = async (e) => {
@@ -1446,6 +1727,9 @@ async function render(el) {
       await saveCheckIn(checkCard, true, o.delta);
       return render(el);
     }
+    if (act === 'autook') { await dismissAuto(); return render(el); }
+    if (act === 'autoundo') { await undoAuto(today); return render(el); }
+    if (act === 'notme') return friendSetupSheet();
     if (act === 'dismiss') { await saveCheckIn(checkCard, false); return render(el); }
   };
   el.onchange = async (e) => {
@@ -1600,7 +1884,7 @@ async function openAddExercise(day, onDone) {
 }
 
 // Sheet for editing one slot: name, scheme, flags, step size and stack, order, and removal.
-function openEditSlot(slot, ex, onDone) {
+function openEditSlot(slot, ex, onDone, siblings = []) {
   const { root, close } = openSheet(`
     <h2>${esc(slot.label)}</h2>
     <label class="field">Name on this day<input id="e-label" value="${esc(slot.label)}"></label>
@@ -1613,7 +1897,8 @@ function openEditSlot(slot, ex, onDone) {
     <label class="check-line"><input type="checkbox" id="e-half" ${slot.partialsOnLastSet ? 'checked' : ''}> Half reps on the last set</label>
     <label class="field">Starting weight, used when there is no history
       <input id="e-start" inputmode="decimal" value="${fmtW(slot.startWeight)}"></label>
-    <div class="muted small" style="margin-top:14px">These belong to the exercise, so they apply on every day it appears.</div>
+    ${siblings.length ? `<label class="check-line"><input type="checkbox" id="e-all" checked> Use the same sets, reps and starting weight on the other ${siblings.length === 1 ? 'day' : 'days'} this exercise appears</label>` : ''}
+    <div class="muted small" style="margin-top:14px">Step size and weight stack belong to the exercise, so they apply on every day it appears.</div>
     <label class="field">Step size lb<input id="e-inc" inputmode="decimal" value="${fmtW(ex.increment)}"></label>
     <label class="field">Weight stack, optional (for example 33, 38, 44)
       <input id="e-ladder" value="${esc((ex.weightLadder || []).join(', '))}"></label>
@@ -1644,6 +1929,14 @@ function openEditSlot(slot, ex, onDone) {
         amrap: q('#e-amrap').checked, partialsOnLastSet: q('#e-half').checked,
         startWeight: num(q('#e-start').value), defaultScheme: false,
       });
+      if (siblings.length && q('#e-all').checked) {
+        for (const sib of siblings) {
+          await put('planSlots', {
+            ...sib, sets, repMin: min, repMax: max, amrap: q('#e-amrap').checked,
+            partialsOnLastSet: q('#e-half').checked, startWeight: num(q('#e-start').value), defaultScheme: false,
+          });
+        }
+      }
       await put('exercises', { ...ex, increment: num(q('#e-inc').value) || ex.increment, weightLadder: ladder.length ? ladder : null });
       close();
       onDone();
@@ -1658,8 +1951,8 @@ return { createExercise, addSlot, removeSlot, moveSlot, openAddExercise, openEdi
 __m['js/screens/workout.js'] = (function () {
 // Workout tab: week overview with targets, the live session screen, and the finish summary.
 const { getAll, getAllByIndex, put, remove, getSetting, setSetting, dateStr, dayKey, weekStart, parseDate } = __m['js/db.js'];
-const { PLAN, DAY_ORDER, DAY_NAMES } = __m['js/seed.js'];
-const { loadPlan, loadHistory, weekTargets, ensureWeekTargets, isBaselineWeek, saveTarget, getRule, targetText } = __m['js/targets.js'];
+const { getDays, DAY_NAMES } = __m['js/seed.js'];
+const { loadPlan, loadHistory, weekTargets, ensureWeekTargets, isBaselineWeek, saveTarget, getRule, targetText, syncWeightToSiblings } = __m['js/targets.js'];
 const { workingWeight, stepWeight, nextTarget, findBests } = __m['js/progression.js'];
 const { esc, fmtW, fmtDate, openSheet, CHECK } = __m['js/ui.js'];
 const { openAddExercise, removeSlot } = __m['js/plan.js'];
@@ -1670,8 +1963,9 @@ let restHandle = null; // rest timer interval
 async function render(el, arg) {
   stopRest();
   S = null;
-  if (arg && DAY_ORDER.includes(arg)) return renderSession(el, arg);
-  return renderList(el);
+  const days = await getDays();
+  if (arg && days.some((d) => d.key === arg)) return renderSession(el, arg, days);
+  return renderList(el, days);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1705,7 +1999,7 @@ function statusOf(session) {
 /* Week overview                                                       */
 /* ------------------------------------------------------------------ */
 
-async function renderList(el) {
+async function renderList(el, dayList) {
   const ws = weekStart();
   await ensureWeekTargets(ws);
   const { exercises, slots } = await loadPlan();
@@ -1725,7 +2019,8 @@ async function renderList(el) {
          <h2>${goal} rep goal</h2>
          <div class="muted small">Built from last week. Tap an exercise under Targets to change one.</div></div>`;
 
-  const days = DAY_ORDER.map((d) => {
+  const dayCards = dayList.map((info) => {
+    const d = info.key;
     const daySlots = slots.filter((s) => s.day === d);
     const sess = latest(sessions.filter((s) => s.day === d));
     const st = statusOf(sess);
@@ -1750,8 +2045,8 @@ async function renderList(el) {
     return `
       <div class="card">
         <h3>${DAY_NAMES[d]}${d === today ? ', today' : ''}</h3>
-        <h2>${esc(PLAN[d].title)}</h2>
-        <div class="muted small">${esc(PLAN[d].subtitle)}${st.text ? ', ' + st.text : ''}</div>
+        <h2>${esc(info.title)}</h2>
+        <div class="muted small">${esc(info.subtitle || '')}${st.text ? ', ' + st.text : ''}</div>
         <a class="btn ${d === today ? '' : 'secondary'}" href="#/workout/${d}" style="text-decoration:none;text-align:center;line-height:52px">${st.label}</a>
         <details class="targets">
           <summary>Targets (${daySlots.length} exercises)</summary>
@@ -1764,7 +2059,7 @@ async function renderList(el) {
     <div class="header"><h1>Workout</h1></div>
     <p class="sub">Week of ${fmtDate(ws)}</p>
     ${banner}
-    ${days}
+    ${dayCards}
   `;
 
   el.onclick = async (e) => {
@@ -1772,11 +2067,12 @@ async function renderList(el) {
     if (!btn) return;
     const slot = slots.find((s) => s.id === btn.dataset.slot);
     const ex = exercises.get(slot.exerciseId);
-    openOverride(slot, ex, targets.get(slot.id), ws, () => renderList(el));
+    const sibs = slots.some((x) => x.exerciseId === slot.exerciseId && x.id !== slot.id);
+    openOverride(slot, ex, targets.get(slot.id), ws, () => renderList(el, dayList), sibs);
   };
 }
 
-function openOverride(slot, ex, row, ws, done) {
+function openOverride(slot, ex, row, ws, done, hasSiblings = false) {
   const showW = ex.kind !== 'bodyweight' || (row && row.targetWeight > 0);
   const reps = (row && row.targetReps) || [];
   const repInputs = Array.from({ length: slot.sets }, (_, i) =>
@@ -1790,20 +2086,22 @@ function openOverride(slot, ex, row, ws, done) {
       <input id="ow" inputmode="decimal" value="${fmtW(row ? row.targetWeight : '')}"></label>` : ''}
     <label class="field">Reps for each set
       <div class="reprow">${repInputs}</div></label>
+    ${hasSiblings ? '<label class="check-line"><input type="checkbox" id="o-all" checked> Use the same for the other days this exercise appears</label>' : ''}
     ${drop}
     <button class="btn" data-act="save">Save target</button>
     <button class="btn secondary" data-act="cancel">Cancel</button>
   `);
+  const applyAll = () => hasSiblings && root.querySelector('#o-all').checked;
   root.addEventListener('click', async (e) => {
     const act = e.target.closest('[data-act]')?.dataset.act;
     if (!act) return;
     if (act === 'cancel') return close();
     if (act === 'usedrop') {
-      await saveTarget(ws, slot, { targetWeight: row.suggestion.targetWeight, targetReps: row.suggestion.targetReps });
+      await saveTarget(ws, slot, { targetWeight: row.suggestion.targetWeight, targetReps: row.suggestion.targetReps }, applyAll());
     } else if (act === 'save') {
       const w = root.querySelector('#ow') ? num(root.querySelector('#ow').value) : (row ? row.targetWeight : null);
       const r = [...root.querySelectorAll('.reprow input')].map((i) => int(i.value) || 0);
-      await saveTarget(ws, slot, { targetWeight: w, targetReps: r });
+      await saveTarget(ws, slot, { targetWeight: w, targetReps: r }, applyAll());
     } else return;
     close();
     done();
@@ -1814,7 +2112,7 @@ function openOverride(slot, ex, row, ws, done) {
 /* Session screen                                                      */
 /* ------------------------------------------------------------------ */
 
-async function renderSession(el, day) {
+async function renderSession(el, day, dayList) {
   const ws = weekStart();
   const today = dateStr();
   await ensureWeekTargets(ws);
@@ -1834,6 +2132,7 @@ async function renderSession(el, day) {
 
   S = {
     el, session, day, ws, exercises, slots,
+    dayInfo: dayList.find((d) => d.key === day) || { title: 'Workout', subtitle: '' },
     targets: await weekTargets(ws),
     baseline: await isBaselineWeek(ws),
     hist: await loadHistory(session.id),
@@ -1861,13 +2160,9 @@ function prefillWeight(slot) {
   const last = lastEntry(slot.exerciseId);
   if (last) {
     const lw = workingWeight(last.sets, slot.repMin, ex.kind);
-    if (w == null) {
-      w = lw;
-    } else if (last.session.date && weekStart(parseDate(last.session.date)) === S.ws) {
-      // He already moved this exercise on another day this week.
-      const harder = ex.kind === 'assisted' ? lw < w : lw > w;
-      if (harder) w = lw;
-    }
+    // If this exercise was already logged on another day this week, use that weight, up or down.
+    const sameWeek = last.session.date && weekStart(parseDate(last.session.date)) === S.ws;
+    if (w == null || sameWeek) w = lw;
   }
   if (w == null) w = slot.startWeight;
   if (ex.kind === 'bodyweight' && !(w > 0)) return null;
@@ -1895,11 +2190,12 @@ function restLabel() { return S.rest ? `Rest ${S.rest}s` : 'Rest off'; }
 
 function draw() {
   const { el, slots } = S;
-  const plan = PLAN[S.day];
+  const plan = S.dayInfo;
   el.innerHTML = `
     <a class="back" href="#/workout">Workout</a>
     <div class="header"><h1>${esc(plan.title)}</h1><button class="chip" data-act="rest-cycle">${restLabel()}</button></div>
     <p class="sub">${esc(plan.subtitle)}${S.baseline ? '. Baseline week, log what you lift.' : ''}</p>
+    ${slots.length ? '' : '<div class="card"><h2>No exercises yet</h2><div class="muted">Add your first exercise below.</div></div>'}
     <div id="cards">${slots.map(cardHtml).join('')}</div>
     <button class="btn secondary" data-act="addex">Add exercise</button>
     <div id="sessionbar">
@@ -2192,7 +2488,7 @@ async function onClick(e) {
     const slot = S.slots.find((x) => x.id === btn.dataset.slot);
     const mine = S.sets.filter((r) => r.slotId === slot.id);
     if (mine.some((r) => r.completed)) return alert('Uncheck the logged sets first, then remove it.');
-    if (!confirm(`Remove ${slot.label} from ${PLAN[S.day].title}? Your history stays saved.`)) return;
+    if (!confirm(`Remove ${slot.label} from ${S.dayInfo.title}? Your history stays saved.`)) return;
     for (const r of mine) await remove('sets', r.id);
     S.sets = S.sets.filter((r) => r.slotId !== slot.id);
     await removeSlot(slot.id);
@@ -2252,6 +2548,19 @@ async function finish() {
   for (const r of S.sets.filter((x) => !x.completed && !(x.reps > 0))) await remove('sets', r.id);
   S.session.finishedAt = Date.now();
   await put('sessions', S.session);
+  // Other days of the same exercise take the weight you used today.
+  const byEx = new Map();
+  for (const r of S.sets.filter((x) => x.completed && x.reps > 0)) {
+    if (!byEx.has(r.exerciseId)) byEx.set(r.exerciseId, []);
+    byEx.get(r.exerciseId).push(r);
+  }
+  for (const [exId, sets] of byEx) {
+    const ex = S.exercises.get(exId);
+    const slot = S.slots.find((x) => x.exerciseId === exId);
+    if (!ex || !slot) continue;
+    const w = workingWeight(sets, slot.repMin, ex.kind);
+    if (ex.kind !== 'bodyweight' || w > 0) await syncWeightToSiblings(exId, w, S.ws, slot.id);
+  }
   const { el, session } = S;
   stopRest();
   S = null;
@@ -2272,6 +2581,8 @@ async function renderSummary(el, session) {
   const baseline = await isBaselineWeek(ws);
   const hist = await loadHistory(session.id);
   const rule = await getRule();
+  const days = await getDays();
+  const dayInfo = days.find((d) => d.key === session.day) || { title: 'Workout' };
 
   let totalReps = 0;
   let volume = 0;
@@ -2326,14 +2637,14 @@ async function renderSummary(el, session) {
     if (act === 'reopen') {
       session.finishedAt = null;
       await put('sessions', session);
-      renderSession(el, session.day);
+      renderSession(el, session.day, days);
     }
   };
   el.onchange = null;
   el.innerHTML = `
     <a class="back" href="#/today">Today</a>
     <div class="header"><h1>Workout done</h1></div>
-    <p class="sub">${esc(PLAN[session.day].title)}, ${fmtDate(session.date)}</p>
+    <p class="sub">${esc(dayInfo.title)}, ${fmtDate(session.date)}</p>
     <div class="card stats">
       <div><b>${totalReps}</b><span>reps</span></div>
       <div><b>${Math.round(volume).toLocaleString()}</b><span>lb volume</span></div>
@@ -2357,6 +2668,7 @@ __m['js/screens/food.js'] = (function () {
 const { getAll, getAllByIndex, put, remove, getSetting, setSetting, dateStr, dayKey, parseDate } = __m['js/db.js'];
 const { targetFor } = __m['js/stats.js'];
 const { esc, fmtLong, openSheet, addDays, nowTime } = __m['js/ui.js'];
+const { getDays } = __m['js/seed.js'];
 
 let viewDate = null; // lets you log for another day when you forgot
 
@@ -2394,7 +2706,7 @@ async function render(el) {
     kcal: a.kcal + (e.kcal || 0), protein: a.protein + (e.protein || 0),
     carbs: a.carbs + (e.carbs || 0), fat: a.fat + (e.fat || 0),
   }), { kcal: 0, protein: 0, carbs: 0, fat: 0 });
-  const liftDay = ['mon', 'wed', 'fri'].includes(dayKey(parseDate(date)));
+  const liftDay = (await getDays()).some((d) => d.key === dayKey(parseDate(date)));
   const carbDone = await getSetting(`carbPortion:${date}`, false);
   const waterOn = await getSetting('waterOn', false);
   const water = waterOn ? await getSetting(`water:${date}`, 0) : 0;
@@ -2846,11 +3158,14 @@ return { render };
 /* ===== js/screens/settings.js ===== */
 __m['js/screens/settings.js'] = (function () {
 const { getAll, getAllByIndex, put, count, getSetting, setSetting, dateStr, STORE_NAMES } = __m['js/db.js'];
-const { PLAN, DAY_ORDER, DAY_NAMES } = __m['js/seed.js'];
+const { getDays, DAY_NAMES } = __m['js/seed.js'];
+const { rebaseline } = __m['js/autotargets.js'];
+const { friendSetupSheet } = __m['js/screens/setup.js'];
+const { steadyWeight } = __m['js/autotargets.js'];
 const { esc, fmtW, openSheet } = __m['js/ui.js'];
 const { openAddExercise, openEditSlot } = __m['js/plan.js'];
 const { targetFor } = __m['js/stats.js'];
-const { exportAll, countsOf, importAll, resetAll, csvOf, shareOrDownload, exportJsonFile } = __m['js/backup.js'];
+const { exportAll, countsOf, importAll, resetAll, resetProgress, csvOf, shareOrDownload, exportJsonFile } = __m['js/backup.js'];
 
 function badges(s) {
   const out = [];
@@ -2875,10 +3190,16 @@ async function render(el) {
   const waterOn = await getSetting('waterOn', false);
   const lastExport = await getSetting('lastExport', null);
   const target = await targetFor(dateStr());
+  const dayList = await getDays();
+  const autoProtein = await getSetting('autoProtein', true);
+  const autoKcal = await getSetting('autoKcal', false);
+  const sw = await steadyWeight();
+  const ppl = await getSetting('proteinPerLb', null);
 
   let planHtml = '';
   const slotsAll = [];
-  for (const day of DAY_ORDER) {
+  for (const info of dayList) {
+    const day = info.key;
     const slots = (await getAllByIndex('planSlots', 'day', day)).sort((a, b) => a.order - b.order);
     slotsAll.push(...slots);
     const rows = slots.map((s) => {
@@ -2898,10 +3219,11 @@ async function render(el) {
     planHtml += `
       <div class="card">
         <h3>${DAY_NAMES[day]}</h3>
-        <h2>${esc(PLAN[day].title)}</h2>
-        <div class="muted small" style="margin-bottom:6px">${esc(PLAN[day].subtitle)}</div>
+        <h2>${esc(info.title)}</h2>
+        <div class="muted small" style="margin-bottom:6px">${esc(info.subtitle || '')}</div>
         ${rows}
         <button class="btn secondary" data-act="add" data-day="${day}">Add exercise</button>
+        <button class="link" data-act="renameday" data-day="${day}">Rename this day</button>
       </div>`;
   }
 
@@ -2948,6 +3270,16 @@ async function render(el) {
       <label class="check-line" style="margin-top:8px"><input type="checkbox" data-act="water" ${waterOn ? 'checked' : ''}> Show a water counter on the Food tab</label>
     </div>
 
+    <div class="card">
+      <h3>Targets follow your weight</h3>
+      <label class="check-line"><input type="checkbox" data-act="autoprotein" ${autoProtein ? 'checked' : ''}> Protein follows my body weight</label>
+      <label class="check-line"><input type="checkbox" data-act="autokcal" ${autoKcal ? 'checked' : ''}> Calories follow my body weight</label>
+      <div class="small muted" style="margin-top:8px;line-height:1.45">
+        ${ppl && sw ? `Your ratio is ${ppl.toFixed(2)} g of protein per lb at about ${sw.toFixed(1)} lb. ` : 'Needs 3 weigh ins in a week to start. '}
+        Protein moves in steps of 5 g, at most once a week, and you get a notice with an Undo. Calories are off by default because your check in already changes them from your weight and waist trend, and the two would fight each other.
+      </div>
+    </div>
+
     <p class="sub" style="margin-top:16px">Your plan. Tap an exercise to edit it, reorder it or remove it. Add anything new at the bottom of each day.</p>
     ${planHtml}
 
@@ -2964,7 +3296,11 @@ async function render(el) {
       <h3>Data on this phone</h3>
       <div class="row"><div>Storage</div><div class="scheme">${persisted}</div></div>
       ${counts.join('')}
+      <button class="btn secondary" data-act="resetprog" style="color:#FBBF24">Reset progress</button>
+      <div class="small muted" style="margin-top:6px">Clears the logs you choose. Your plan and presets stay.</div>
       <button class="btn secondary" data-act="reset" style="color:#FBBF24">Reset everything</button>
+      <button class="btn secondary" data-act="notme">I'm not Mahi</button>
+      <div class="small muted" style="margin-top:6px">Wipes this phone and starts a fresh setup for someone else.</div>
     </div>
   `;
 
@@ -2977,16 +3313,22 @@ async function render(el) {
     if (act === 'rest') { await setSetting('restTimerSeconds', Number(btn.dataset.val)); return again(); }
     if (act === 'edit') {
       const slot = slotsAll.find((s) => s.id === btn.dataset.slot);
-      return openEditSlot(slot, exercises.get(slot.exerciseId), again);
+      const sibs = slotsAll.filter((x) => x.exerciseId === slot.exerciseId && x.id !== slot.id);
+      return openEditSlot(slot, exercises.get(slot.exerciseId), again, sibs);
     }
     if (act === 'add') return openAddExercise(btn.dataset.day, again);
+    if (act === 'renameday') return renameDay(dayList, btn.dataset.day, again);
     if (act === 'targets') return editTargets(target, again);
     if (act === 'export') { await exportJsonFile(); return again(); }
     if (act === 'csv') return csvSheet();
     if (act === 'reset') return resetSheet();
+    if (act === 'resetprog') return resetProgressSheet();
+    if (act === 'notme') return friendSetupSheet();
   };
   el.onchange = async (e) => {
     if (e.target.dataset.act === 'water') { await setSetting('waterOn', e.target.checked); return; }
+    if (e.target.dataset.act === 'autoprotein') { await setSetting('autoProtein', e.target.checked); await rebaseline(); return render(el); }
+    if (e.target.dataset.act === 'autokcal') { await setSetting('autoKcal', e.target.checked); await rebaseline(); return render(el); }
     if (e.target.id === 'import' && e.target.files[0]) importSheet(e.target.files[0]);
   };
 }
@@ -3010,6 +3352,7 @@ function editTargets(t, done) {
     const g = (id) => num(root.querySelector(id).value);
     if (!(g('#t-kcal') > 0) || !(g('#t-pro') > 0)) return;
     await put('nutritionTargets', { effectiveDate: dateStr(), kcal: g('#t-kcal'), protein: g('#t-pro'), carbs: g('#t-carb') || 0, fat: g('#t-fat') || 0, reason: 'Manual change' });
+    await rebaseline();
     close();
     done();
   });
@@ -3070,13 +3413,62 @@ function resetSheet() {
   });
 }
 
+function resetProgressSheet() {
+  const { root, close } = openSheet(`
+    <h2>Reset progress</h2>
+    <div class="muted small">Pick what to clear. Your plan, exercises, presets and settings stay. Your two starting history entries (triceps and machine chest press) stay too. Export a backup first if you might want this data. Clearing workouts also restarts your baseline week.</div>
+    <label class="check-line"><input type="checkbox" id="rp-workouts" checked> Workouts and targets</label>
+    <label class="check-line"><input type="checkbox" id="rp-weight" checked> Weigh ins and waist</label>
+    <label class="check-line"><input type="checkbox" id="rp-food" checked> Food log</label>
+    <label class="check-line"><input type="checkbox" id="rp-checkins" checked> Check ins</label>
+    <label class="check-line"><input type="checkbox" id="rp-photos" checked> Progress photos</label>
+    <label class="field">Type RESET to continue<input id="rp-word" autocapitalize="characters" placeholder="RESET"></label>
+    <button class="btn" data-act="go" style="background:#FBBF24;color:#2b2000">Clear selected</button>
+    <button class="btn secondary" data-act="cancel">Cancel</button>`);
+  root.addEventListener('click', async (e) => {
+    const act = e.target.closest('[data-act]')?.dataset.act;
+    if (act === 'cancel') return close();
+    if (act !== 'go') return;
+    if (root.querySelector('#rp-word').value.trim() !== 'RESET') return root.querySelector('#rp-word').classList.add('shake');
+    const on = (id) => root.querySelector(id).checked;
+    await resetProgress({
+      workouts: on('#rp-workouts'), weight: on('#rp-weight'), food: on('#rp-food'),
+      checkins: on('#rp-checkins'), photos: on('#rp-photos'),
+    });
+    close();
+    location.hash = '#/today';
+    location.reload();
+  });
+}
+
+function renameDay(dayList, key, done) {
+  const info = dayList.find((d) => d.key === key);
+  const { root, close } = openSheet(`
+    <h2>Rename ${DAY_NAMES[key]}</h2>
+    <label class="field">Title<input id="d-title" value="${esc(info.title)}"></label>
+    <label class="field">Subtitle, optional<input id="d-sub" value="${esc(info.subtitle || '')}"></label>
+    <button class="btn" data-act="save">Save</button>
+    <button class="btn secondary" data-act="cancel">Cancel</button>`);
+  root.addEventListener('click', async (e) => {
+    const act = e.target.closest('[data-act]')?.dataset.act;
+    if (act === 'cancel') return close();
+    if (act !== 'save') return;
+    const next = dayList.map((d) => (d.key === key
+      ? { ...d, title: root.querySelector('#d-title').value.trim() || d.title, subtitle: root.querySelector('#d-sub').value.trim() }
+      : d));
+    await setSetting('days', next);
+    close();
+    done();
+  });
+}
+
 return { render };
 })();
 
 /* ===== js/app.js ===== */
 __m['js/app.js'] = (function () {
 // Router, tab bar and boot.
-const { openDB } = __m['js/db.js'];
+const { openDB, getSetting } = __m['js/db.js'];
 const { seedIfEmpty, migratePlan } = __m['js/seed.js'];
 const { ensureWeekTargets } = __m['js/targets.js'];
 const today = __m['js/screens/today.js'];
@@ -3085,12 +3477,15 @@ const food = __m['js/screens/food.js'];
 const weight = __m['js/screens/weight.js'];
 const progress = __m['js/screens/progress.js'];
 const settings = __m['js/screens/settings.js'];
+const setup = __m['js/screens/setup.js'];
 
-const ROUTES = { today, workout, food, weight, progress, settings };
+const ROUTES = { today, workout, food, weight, progress, settings, setup };
 const app = document.getElementById('app');
 
 async function route() {
-  const [name, arg] = (location.hash.replace('#/', '') || 'today').split('?')[0].split('/');
+  let [name, arg] = (location.hash.replace('#/', '') || 'today').split('?')[0].split('/');
+  if (await getSetting('needsSetup', false)) name = 'setup';
+  document.body.classList.toggle('setup', name === 'setup');
   const screen = ROUTES[name] || today;
   const tab = ROUTES[name] ? name : 'today';
 

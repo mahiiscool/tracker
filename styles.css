@@ -242,3 +242,7 @@ input.big { font-size: 24px; font-weight: 700; text-align: center; min-height: 5
 html { color-scheme: dark; }
 .weighrow input { min-width: 0; width: 100%; }
 .weighrow span { flex: none; }
+body.setup #tabbar { display: none; }
+.notme { display: block; margin: 8px auto 0; color: var(--muted); }
+.dayrow { display: grid; grid-template-columns: 120px 1fr; gap: 10px; align-items: center; margin-top: 6px; }
+.dayrow input[type=text] { width: 100%; }
