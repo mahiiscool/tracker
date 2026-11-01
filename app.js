@@ -893,6 +893,71 @@ async function dismissAuto() { await remove('settings', 'autoUndo'); }
 return { SETTINGS, steadyWeight, rebaseline, maybeAutoAdjust, undoAuto, dismissAuto };
 })();
 
+/* ===== js/goals.js ===== */
+__m['js/goals.js'] = (function () {
+// Goal based calorie and protein math, and how check ins react to each goal.
+//
+// Maintenance calories are estimated as body weight in pounds times an activity number.
+// The goal then moves calories up or down by a percentage. These are starting estimates only:
+// the check in every 2 weeks corrects them from your real weight and waist.
+
+const GOALS = {
+  bulk:     { label: 'Bulking',     hint: 'Gain weight slowly',            kcalAdj: 0.10,  proteinPerLb: 0.8 },
+  cut:      { label: 'Cutting',     hint: 'Lose fat',                       kcalAdj: -0.20, proteinPerLb: 1.0 },
+  maintain: { label: 'Maintaining', hint: 'Stay about the same',            kcalAdj: 0,     proteinPerLb: 0.8 },
+  recomp:   { label: 'Recomping',   hint: 'Lose fat and build muscle together', kcalAdj: -0.05, proteinPerLb: 1.0 },
+};
+
+const ACTIVITY = {
+  low:      { label: 'Mostly sitting outside the gym', perLb: 14 },
+  moderate: { label: 'On my feet some of the day',     perLb: 16 },
+  high:     { label: 'Active job or lots of cardio',   perLb: 18 },
+};
+
+const r5 = (x) => Math.round(x / 5) * 5;
+const r50 = (x) => Math.round(x / 50) * 50;
+
+// Returns { maintenance, kcal, protein, fat, carbs }.
+function suggestTargets(goal, weightLb, activity = 'moderate') {
+  const g = GOALS[goal] || GOALS.maintain;
+  const a = ACTIVITY[activity] || ACTIVITY.moderate;
+  const maintenance = r50(weightLb * a.perLb);
+  const kcal = r50(maintenance * (1 + g.kcalAdj));
+  const protein = r5(weightLb * g.proteinPerLb);
+  const fat = Math.round((kcal * 0.27) / 9);
+  const carbs = Math.max(0, Math.round((kcal - protein * 4 - fat * 9) / 4));
+  return { maintenance, kcal, protein, fat, carbs };
+}
+
+// What a check in should say for each goal.
+// dW is the change in the 7 day average weight over two weeks, in lb. weight is the current average.
+// Returns a list of cases, each { headline, options: [{ label, delta }] }. Empty means nothing to change.
+const add = [{ label: 'Add 100 kcal', delta: 100 }, { label: 'Add 150 kcal', delta: 150 }];
+const sub = [{ label: 'Subtract 100 kcal', delta: -100 }];
+
+function checkInCases(goal, { dW, weight, waistGrowing }) {
+  const perWeekPct = ((dW / 2) / weight) * 100;
+  const cases = [];
+  if (goal === 'cut') {
+    if (perWeekPct <= -1.0) cases.push({ headline: 'You are losing faster than about 1 percent of body weight a week. Eat a little more to protect muscle.', options: add });
+    else if (dW > -0.5) cases.push({ headline: 'Your weight is not coming down yet.', options: sub });
+  } else if (goal === 'bulk') {
+    if (dW <= -0.5) cases.push({ headline: 'Your weekly average weight is dropping.', options: add });
+    else if (dW >= 2.0) cases.push({ headline: 'You are gaining faster than about 1 lb a week.', options: sub });
+  } else if (goal === 'recomp') {
+    if (dW <= -1.5) cases.push({ headline: 'Your weight is dropping faster than a recomp needs.', options: add });
+    else if (dW >= 1.5) cases.push({ headline: 'Your weight is creeping up.', options: sub });
+  } else {
+    if (dW <= -1.0) cases.push({ headline: 'Your weight is drifting down.', options: add });
+    else if (dW >= 1.0) cases.push({ headline: 'Your weight is drifting up.', options: sub });
+  }
+  if (waistGrowing) cases.push({ headline: 'Your waist is growing.', options: sub });
+  return cases;
+}
+
+return { GOALS, ACTIVITY, suggestTargets, checkInCases };
+})();
+
 /* ===== js/backup.js ===== */
 __m['js/backup.js'] = (function () {
 // Export, import and CSV. Everything lives on this phone, so a backup file is the safety net.
@@ -1037,6 +1102,7 @@ return { exportAll, countsOf, importAll, resetProgress, resetAll, csvOf, shareOr
 __m['js/screens/setup.js'] = (function () {
 // First time setup for someone else ("I'm not Mahi"): name, training days, targets.
 const { put, getSetting, setSetting, dateStr } = __m['js/db.js'];
+const { GOALS, ACTIVITY, suggestTargets } = __m['js/goals.js'];
 const { openSheet, esc } = __m['js/ui.js'];
 const { startFriendSetup } = __m['js/backup.js'];
 
@@ -1087,19 +1153,59 @@ async function render(el) {
     </div>
 
     <div class="card">
+      <h3>Your goal</h3>
+      <div class="segs goalsegs">
+        ${Object.entries(GOALS).map(([k, g]) => `<button class="seg" data-goal="${k}">${g.label}</button>`).join('')}
+      </div>
+      <div class="small muted" id="goalhint" style="margin-top:8px">Pick one. It sets your calorie math and how your check ins react.</div>
+      <div class="grid2">
+        <label class="field">Current weight lb<input id="s-weight" inputmode="decimal" placeholder="lb"></label>
+        <label class="field">Activity
+          <select id="s-act">${Object.entries(ACTIVITY).map(([k, a]) => `<option value="${k}" ${k === 'moderate' ? 'selected' : ''}>${a.label}</option>`).join('')}</select></label>
+      </div>
+    </div>
+
+    <div class="card">
       <h3>Daily targets</h3>
       <div class="grid2">
         <label class="field" style="margin-top:0">Calories<input id="s-kcal" inputmode="numeric" placeholder="kcal"></label>
         <label class="field" style="margin-top:0">Protein g<input id="s-pro" inputmode="numeric" placeholder="g"></label>
       </div>
-      <div class="small muted" style="margin-top:8px;line-height:1.45">Not sure? A common protein target is about 0.7 to 1 g per pound of body weight. You can change these any time.</div>
+      <div class="small muted" id="estnote" style="margin-top:8px;line-height:1.45">Pick a goal and enter your weight and these fill in as an estimate. You can type your own numbers instead.</div>
     </div>
 
     <div class="card"><div class="small muted" style="line-height:1.45">Your plan starts empty. After this, open Settings and use Add exercise on each day to build it. Weights are in pounds.</div></div>
     <button class="btn" data-act="finish">Finish setup</button>`;
 
+  let goal = null;
+  const touched = { kcal: false, pro: false };
+  const refresh = () => {
+    const w = parseFloat(el.querySelector('#s-weight').value.replace(',', '.'));
+    if (!goal || !(w > 50)) return;
+    const t = suggestTargets(goal, w, el.querySelector('#s-act').value);
+    if (!touched.kcal) el.querySelector('#s-kcal').value = t.kcal;
+    if (!touched.pro) el.querySelector('#s-pro').value = t.protein;
+    el.querySelector('#estnote').textContent =
+      `Estimate: about ${t.maintenance} kcal to maintain your weight, ${GOALS[goal].label.toLowerCase()} adjusts that. Your check ins fine tune it from your real weight and waist.`;
+  };
+  el.oninput = (e) => {
+    if (e.target.id === 's-kcal') touched.kcal = true;
+    if (e.target.id === 's-pro') touched.pro = true;
+    if (e.target.id === 's-weight') refresh();
+  };
+  el.onchange = (e) => { if (e.target.id === 's-act') refresh(); };
+
   el.onclick = async (e) => {
+    const g = e.target.closest('[data-goal]');
+    if (g) {
+      goal = g.dataset.goal;
+      el.querySelectorAll('[data-goal]').forEach((b) => b.classList.toggle('on', b === g));
+      el.querySelector('#goalhint').textContent = GOALS[goal].hint + '.';
+      return refresh();
+    }
     if (e.target.closest('[data-act]')?.dataset.act !== 'finish') return;
+    if (!goal) return alert('Pick your goal first.');
+    const wt = parseFloat(el.querySelector('#s-weight').value.replace(',', '.'));
     const kcal = parseInt(el.querySelector('#s-kcal').value, 10);
     const protein = parseInt(el.querySelector('#s-pro').value, 10);
     const keys = [...el.querySelectorAll('[data-day]')].filter((c) => c.checked).map((c) => c.dataset.day);
@@ -1116,6 +1222,9 @@ async function render(el) {
     const fat = Math.round((kcal * 0.28) / 9);
     const carbs = Math.max(0, Math.round((kcal - protein * 4 - fat * 9) / 4));
     await put('nutritionTargets', { effectiveDate: dateStr(), kcal, protein, fat, carbs, reason: 'Setup' });
+    await setSetting('goal', goal);
+    await setSetting('activity', el.querySelector('#s-act').value);
+    if (wt > 50 && wt < 600) await put('weights', { date: dateStr(), time: '07:00', lb: Math.round(wt * 10) / 10 });
     await setSetting('days', days);
     await setSetting('userName', el.querySelector('#s-name').value.trim());
     await setSetting('needsSetup', false);
@@ -1402,9 +1511,10 @@ return { summaryLine, weighInHtml, saveWeighIn, weightChart, waistChart, render 
 /* ===== js/checkin.js ===== */
 __m['js/checkin.js'] = (function () {
 // Check in every 14 days: compares weight, waist and lifts, then suggests a calorie change.
-const { getAll, put, dateStr } = __m['js/db.js'];
+const { getAll, put, dateStr, getSetting } = __m['js/db.js'];
 const { addDays, diffDays } = __m['js/ui.js'];
 const { rebaseline } = __m['js/autotargets.js'];
+const { GOALS, checkInCases } = __m['js/goals.js'];
 const { dailyWeights, avgWindow, waistEntries, targetFor, liftData } = __m['js/stats.js'];
 
 const RULES = {
@@ -1476,27 +1586,26 @@ async function computeCheckIn(today = dateStr()) {
   const lifts = await liftsTrend(today);
   const target = await targetFor(today);
 
-  const dropping = dW <= RULES.weightDrop;
+  // Your goal decides what counts as a problem. No goal saved means bulking, the original rules.
+  const goal = await getSetting('goal', 'bulk');
   const waistGrowing = dWaist !== null && dWaist >= RULES.waistGrow;
+  const cases = checkInCases(goal, { dW, weight: now, waistGrowing });
   const options = [];
   let headline;
-
-  if (dropping && waistGrowing) {
-    headline = 'Signals conflict. Weight is dropping but your waist is growing. You choose.';
-    options.push({ label: 'Add 100 kcal', delta: 100 }, { label: 'Add 150 kcal', delta: 150 }, { label: 'Subtract 100 kcal', delta: -100 });
-  } else if (dropping) {
-    headline = 'Your weekly average weight is dropping.';
-    options.push({ label: 'Add 100 kcal', delta: 100 }, { label: 'Add 150 kcal', delta: 150 });
-  } else if (waistGrowing) {
-    headline = 'Your waist is growing.';
-    options.push({ label: 'Subtract 100 kcal', delta: -100 });
+  if (cases.length > 1) {
+    headline = 'Signals conflict: ' + cases.map((c) => c.headline.replace(/\.$/, '').toLowerCase()).join(', but ') + '. You choose.';
+    for (const c of cases) for (const o of c.options) if (!options.some((x) => x.delta === o.delta)) options.push(o);
+  } else if (cases.length === 1) {
+    headline = cases[0].headline;
+    options.push(...cases[0].options);
   } else if (lifts.going) {
-    headline = "It's working, keep going.";
+    headline = goal === 'cut' ? 'On track. Weight is coming down and your lifts are holding or rising.' : "It's working, keep going.";
   } else {
-    headline = 'Weight and waist are steady. No change needed.';
+    headline = goal === 'cut' ? 'On track. Keep going.' : 'Weight and waist are steady. No change needed.';
   }
 
   const parts = [
+    `Goal: ${GOALS[goal].label}`,
     `Weekly average weight ${now.toFixed(1)} lb, ${dW >= 0 ? '+' : ''}${dW.toFixed(1)} vs two weeks ago`,
     dWaist === null ? 'Waist: not enough entries' : `Waist ${dWaist >= 0 ? '+' : ''}${dWaist.toFixed(2)} in`,
     lifts.total ? `Lifts up: ${lifts.up} of ${lifts.total}` : 'Lifts: not enough data',
@@ -3160,6 +3269,8 @@ __m['js/screens/settings.js'] = (function () {
 const { getAll, getAllByIndex, put, count, getSetting, setSetting, dateStr, STORE_NAMES } = __m['js/db.js'];
 const { getDays, DAY_NAMES } = __m['js/seed.js'];
 const { rebaseline } = __m['js/autotargets.js'];
+const { GOALS, ACTIVITY, suggestTargets } = __m['js/goals.js'];
+const { dailyWeights } = __m['js/stats.js'];
 const { friendSetupSheet } = __m['js/screens/setup.js'];
 const { steadyWeight } = __m['js/autotargets.js'];
 const { esc, fmtW, openSheet } = __m['js/ui.js'];
@@ -3193,6 +3304,7 @@ async function render(el) {
   const dayList = await getDays();
   const autoProtein = await getSetting('autoProtein', true);
   const autoKcal = await getSetting('autoKcal', false);
+  const goal = await getSetting('goal', 'bulk');
   const sw = await steadyWeight();
   const ppl = await getSetting('proteinPerLb', null);
 
@@ -3261,6 +3373,15 @@ async function render(el) {
     </div>
 
     <div class="card">
+      <h3>My goal</h3>
+      <div class="segs">
+        ${Object.entries(GOALS).map(([k, g]) => seg('goal', k, g.label, goal)).join('')}
+      </div>
+      <div class="small muted" style="margin-top:8px;line-height:1.45">${GOALS[goal].hint}. Your check ins use this goal to decide when to add or cut calories.</div>
+      <button class="btn secondary" data-act="recalc">Recalculate my targets for this goal</button>
+    </div>
+
+    <div class="card">
       <h3>Nutrition targets</h3>
       <div class="row"><div>Calories</div><div class="scheme">${target.kcal} kcal</div></div>
       <div class="row"><div>Protein</div><div class="scheme">${target.protein} g</div></div>
@@ -3309,6 +3430,8 @@ async function render(el) {
     if (!btn) return;
     const act = btn.dataset.act;
     const again = () => render(el);
+    if (act === 'goal') { await setSetting('goal', btn.dataset.val); return again(); }
+    if (act === 'recalc') return recalcSheet(again);
     if (act === 'rule') { await setSetting('moveUpRule', btn.dataset.val); return again(); }
     if (act === 'rest') { await setSetting('restTimerSeconds', Number(btn.dataset.val)); return again(); }
     if (act === 'edit') {
@@ -3457,6 +3580,42 @@ function renameDay(dayList, key, done) {
       ? { ...d, title: root.querySelector('#d-title').value.trim() || d.title, subtitle: root.querySelector('#d-sub').value.trim() }
       : d));
     await setSetting('days', next);
+    close();
+    done();
+  });
+}
+
+async function recalcSheet(done) {
+  const daily = await dailyWeights();
+  if (!daily.length) return alert('Log a weigh in first, then I can work out your numbers.');
+  const weight = (await steadyWeight()) || daily[daily.length - 1].lb;
+  const goal = await getSetting('goal', 'bulk');
+  const activity = await getSetting('activity', 'moderate');
+  const { root, close } = openSheet(`
+    <h2>Targets for ${GOALS[goal].label.toLowerCase()}</h2>
+    <div class="muted small" style="line-height:1.45">Based on about ${weight.toFixed(1)} lb. This is an estimate, and your check ins fine tune it.</div>
+    <label class="field">Activity
+      <select id="r-act">${Object.entries(ACTIVITY).map(([k, a]) => `<option value="${k}" ${k === activity ? 'selected' : ''}>${a.label}</option>`).join('')}</select></label>
+    <div id="r-out"></div>
+    <button class="btn" data-act="apply">Use these targets</button>
+    <button class="btn secondary" data-act="cancel">Cancel</button>`);
+  let t;
+  const show = () => {
+    t = suggestTargets(goal, weight, root.querySelector('#r-act').value);
+    root.querySelector('#r-out').innerHTML = `
+      <div class="row"><div class="muted">Maintenance estimate</div><div class="scheme">${t.maintenance} kcal</div></div>
+      <div class="row"><div>Calories</div><div class="scheme">${t.kcal} kcal</div></div>
+      <div class="row"><div>Protein</div><div class="scheme">${t.protein} g</div></div>`;
+  };
+  show();
+  root.querySelector('#r-act').addEventListener('change', show);
+  root.addEventListener('click', async (e) => {
+    const act = e.target.closest('[data-act]')?.dataset.act;
+    if (act === 'cancel') return close();
+    if (act !== 'apply') return;
+    await setSetting('activity', root.querySelector('#r-act').value);
+    await put('nutritionTargets', { effectiveDate: dateStr(), kcal: t.kcal, protein: t.protein, fat: t.fat, carbs: t.carbs, reason: `Goal: ${GOALS[goal].label}` });
+    await rebaseline();
     close();
     done();
   });
