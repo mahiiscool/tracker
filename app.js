@@ -2463,7 +2463,7 @@ async function ensureSetRows() {
     for (let i = have.length + 1; i <= slot.sets; i++) {
       const row = {
         sessionId: S.session.id, slotId: slot.id, exerciseId: slot.exerciseId,
-        setNumber: i, weight: w, reps: null, partials: null, completed: false, variant,
+        setNumber: i, weight: w, reps: null, partials: null, completed: false, failure: !!slot.amrap, variant,
       };
       row.id = await put('sets', row);
       S.sets.push(row);
@@ -2541,7 +2541,7 @@ function cardHtml(slot) {
 
   const last = lastEntry(slot.exerciseId);
   const lastLine = last
-    ? `Last: ${last.sets.map((s) => (s.weight ? `${fmtW(s.weight)} x ${s.reps}` : `${s.reps}`)).join(', ')} (${fmtDate(last.session.date)})`
+    ? `Last: ${last.sets.map((s) => (s.weight ? `${fmtW(s.weight)} x ${s.reps}` : `${s.reps}`) + (s.failure ? ' F' : '')).join(', ')} (${fmtDate(last.session.date)})`
     : 'First time logging this one';
 
   let targetLine;
@@ -2564,6 +2564,7 @@ function cardHtml(slot) {
         ${showW ? `<input data-f="weight" inputmode="decimal" placeholder="lb" value="${fmtW(r.weight)}">` : '<div></div>'}
         <input data-f="reps" inputmode="numeric" placeholder="${t || 'reps'}" value="${r.reps ?? ''}">
         ${hasPartial ? (isLast ? `<input data-f="partials" inputmode="numeric" placeholder="half" value="${r.partials ?? ''}">` : '<div></div>') : ''}
+        <button class="failbtn ${r.failure ? 'on' : ''}" data-act="fail" aria-pressed="${r.failure ? 'true' : 'false'}" aria-label="Set ${r.setNumber} went to failure">F</button>
         <button class="check" data-act="check" aria-label="Log set ${r.setNumber}">${CHECK}</button>
       </div>`;
   }).join('');
@@ -2594,7 +2595,7 @@ function cardHtml(slot) {
       </div>
       <div class="lines small"><div class="muted">${esc(lastLine)}</div><div>${targetLine}</div></div>
       ${slot.notes ? `<div class="small muted" style="margin-top:4px">${esc(slot.notes)}</div>` : ''}
-      <div class="colhead"><span></span><span>${showW ? wLabel : ''}</span><span>Reps</span>${hasPartial ? '<span>Half</span>' : ''}<span></span></div>
+      <div class="colhead"><span></span><span>${showW ? wLabel : ''}</span><span>Reps</span>${hasPartial ? '<span>Half</span>' : ''}<span class="failhead">Fail</span><span></span></div>
       ${setRows}
       ${banner}
       <div class="exfoot">
@@ -2702,6 +2703,16 @@ async function onClick(e) {
 
   if (act === 'check') return toggleCheck(btn.closest('.setrow'));
 
+  if (act === 'fail') {
+    const rowEl = btn.closest('.setrow');
+    const row = S.sets.find((r) => r.id === Number(rowEl.dataset.set));
+    row.failure = !row.failure;
+    btn.classList.toggle('on', row.failure);
+    btn.setAttribute('aria-pressed', row.failure ? 'true' : 'false');
+    await put('sets', row);
+    return;
+  }
+
   if (act === 'moveup') {
     const { slot, set, from, to } = btn.dataset;
     for (const r of S.sets) {
@@ -2756,7 +2767,7 @@ async function onClick(e) {
     const row = {
       sessionId: S.session.id, slotId: slot.id, exerciseId: slot.exerciseId,
       setNumber: last ? last.setNumber + 1 : 1, weight: last ? last.weight : prefillWeight(slot),
-      reps: null, partials: null, completed: false, variant: last ? last.variant : null,
+      reps: null, partials: null, completed: false, failure: !!slot.amrap, variant: last ? last.variant : null,
     };
     row.id = await put('sets', row);
     S.sets.push(row);
@@ -2930,7 +2941,7 @@ async function renderSummary(el, session) {
     lines.push(`
       <div class="row">
         <div><div class="name">${esc(slot.label)}</div>
-          <div class="meta">${mine.map((s) => (s.weight ? `${fmtW(s.weight)} x ${s.reps}` : s.reps)).join(', ')}</div></div>
+          <div class="meta">${mine.map((s) => (s.weight ? `${fmtW(s.weight)} x ${s.reps}` : s.reps) + (s.failure ? ' F' : '')).join(', ')}</div></div>
         <div class="scheme ${cls}">${goal ? `${reps} / ${goal}` : reps}</div>
       </div>`);
 
