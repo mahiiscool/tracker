@@ -2517,6 +2517,7 @@ function moveUpBanner(slot, ex, rows) {
 
 function rowState(slot, ex, tgt, r, idx) {
   if (!r.completed) return '';
+  if (r.reps == null) return 'done';
   const t = tgt && tgt.targetReps ? tgt.targetReps[idx] : null;
   const sameWeight = !tgt || tgt.targetWeight == null || (r.weight ?? 0) === tgt.targetWeight;
   if (t && sameWeight) return r.reps >= t ? 'done met' : 'done below';
@@ -2676,7 +2677,9 @@ async function toggleCheck(rowEl) {
   if (wInput && ex.kind !== 'bodyweight' && weight === null) return flash(wInput);
 
   let reps = int(rInput.value);
-  if (reps === null) {
+  // You tapped F and left reps empty: log it as a set to failure with the reps lost.
+  const lost = reps === null && row.failure && row.failureUser;
+  if (reps === null && !lost) {
     // One tap logs the target reps, but only when the weight matches the target.
     const tgt = S.targets.get(slot.id);
     const idx = row.setNumber - 1;
@@ -2684,7 +2687,7 @@ async function toggleCheck(rowEl) {
     const sameWeight = tgt && (tgt.targetWeight == null || (weight ?? 0) === tgt.targetWeight);
     if (t && sameWeight) reps = t;
   }
-  if (!(reps > 0)) return flash(rInput);
+  if (!lost && !(reps > 0)) return flash(rInput);
 
   row.weight = weight;
   row.reps = reps;
@@ -2707,6 +2710,7 @@ async function onClick(e) {
     const rowEl = btn.closest('.setrow');
     const row = S.sets.find((r) => r.id === Number(rowEl.dataset.set));
     row.failure = !row.failure;
+    row.failureUser = row.failure;
     btn.classList.toggle('on', row.failure);
     btn.setAttribute('aria-pressed', row.failure ? 'true' : 'false');
     await put('sets', row);
@@ -2914,7 +2918,9 @@ async function renderSummary(el, session) {
   const slots = session.mini
     ? session.miniSlotIds.map((id) => all.find((x) => x.id === id)).filter(Boolean)
     : all.filter((s) => s.day === session.day);
-  const sets = (await getAllByIndex('sets', 'sessionId', session.id)).filter((s) => s.completed && s.reps > 0);
+  const allSets = await getAllByIndex('sets', 'sessionId', session.id);
+  const sets = allSets.filter((s) => s.completed && s.reps > 0);
+  const lostSets = allSets.filter((s) => s.completed && s.reps == null);
   const ws = session.weekStart || weekStart(parseDate(session.date));
   const targets = await weekTargets(ws);
   const baseline = await isBaselineWeek(ws);
@@ -2932,7 +2938,12 @@ async function renderSummary(el, session) {
   for (const slot of slots) {
     const ex = exercises.get(slot.exerciseId);
     const mine = sets.filter((s) => s.slotId === slot.id).sort((a, b) => a.setNumber - b.setNumber);
-    if (!mine.length) continue;
+    const shown = [...mine, ...lostSets.filter((s) => s.slotId === slot.id)].sort((a, b) => a.setNumber - b.setNumber);
+    if (!shown.length) continue;
+    if (!mine.length) {
+      lines.push(`<div class="row"><div><div class="name">${esc(slot.label)}</div><div class="meta">${shown.map((s) => (s.weight ? `${fmtW(s.weight)} x ? F` : '? F')).join(', ')}</div></div><div class="scheme">reps lost</div></div>`);
+      continue;
+    }
     const reps = mine.reduce((a, s) => a + s.reps, 0);
     totalReps += reps;
     if (ex.kind === 'weighted') volume += mine.reduce((a, s) => a + (s.weight || 0) * s.reps, 0);
@@ -2941,7 +2952,7 @@ async function renderSummary(el, session) {
     lines.push(`
       <div class="row">
         <div><div class="name">${esc(slot.label)}</div>
-          <div class="meta">${mine.map((s) => (s.weight ? `${fmtW(s.weight)} x ${s.reps}` : s.reps) + (s.failure ? ' F' : '')).join(', ')}</div></div>
+          <div class="meta">${shown.map((s) => (s.reps == null ? (s.weight ? `${fmtW(s.weight)} x ?` : '?') : (s.weight ? `${fmtW(s.weight)} x ${s.reps}` : s.reps)) + (s.failure ? ' F' : '')).join(', ')}</div></div>
         <div class="scheme ${cls}">${goal ? `${reps} / ${goal}` : reps}</div>
       </div>`);
 
