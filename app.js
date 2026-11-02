@@ -1265,6 +1265,7 @@ function chartSvg({ height = 180, series, xTicks = [], yMin = null, yMax = null,
   const pts = series.flatMap((s) => s.points);
   if (!pts.length) return `<div class="chart empty">${empty}</div>`;
   const f = fmt || ((v) => String(Math.round(v * 10) / 10));
+  let tickStep = 1;
   const m = { l: 40, r: 10, t: 10, b: 24 };
   const pw = W - m.l - m.r;
   const ph = height - m.t - m.b;
@@ -1287,6 +1288,7 @@ function chartSvg({ height = 180, series, xTicks = [], yMin = null, yMax = null,
   if (yMax === null) hi += pad;
 
   const step = niceStep((hi - lo) / 4);
+  tickStep = step;
   const ticks = [];
   for (let v = Math.ceil(lo / step) * step; v <= hi + 1e-9; v += step) ticks.push(Math.round(v * 1000) / 1000);
 
@@ -1296,7 +1298,7 @@ function chartSvg({ height = 180, series, xTicks = [], yMin = null, yMax = null,
   let out = `<svg class="chart" viewBox="0 0 ${W} ${height}" role="img">`;
   for (const t of ticks) {
     out += `<line x1="${m.l}" x2="${W - m.r}" y1="${Y(t)}" y2="${Y(t)}" stroke="${C.grid}" stroke-width="1"/>`;
-    out += `<text x="${m.l - 6}" y="${Y(t) + 3}" fill="${C.text}" font-size="10" text-anchor="end">${f(t)}</text>`;
+    out += `<text x="${m.l - 6}" y="${Y(t) + 3}" fill="${C.text}" font-size="10" text-anchor="end">${f(t, tickStep)}</text>`;
   }
   for (const t of xTicks) {
     out += `<text x="${X(t.x)}" y="${height - 6}" fill="${C.text}" font-size="10" text-anchor="middle">${t.label}</text>`;
@@ -1330,7 +1332,10 @@ function chartSvg({ height = 180, series, xTicks = [], yMin = null, yMax = null,
   return out + (legend ? `<div class="legend">${legend}</div>` : '');
 }
 
-return { COLORS, chartSvg };
+// Label decimals follow the tick spacing, so a tight range shows 157.5 and 158.0, not 158 three times.
+const autoFmt = (v, step = 1) => v.toFixed(step >= 1 ? 0 : step >= 0.1 ? 1 : 2);
+
+return { COLORS, chartSvg, autoFmt };
 })();
 
 /* ===== js/screens/weight.js ===== */
@@ -1338,7 +1343,7 @@ __m['js/screens/weight.js'] = (function () {
 // Weight tab: morning weigh in, trend chart, waist log.
 const { getAll, put, remove, dateStr, weekStart, parseDate } = __m['js/db.js'];
 const { dailyWeights, avgWindow, movingAvg, waistEntries } = __m['js/stats.js'];
-const { chartSvg, COLORS } = __m['js/charts.js'];
+const { chartSvg, COLORS, autoFmt } = __m['js/charts.js'];
 const { esc, fmtDate, fmtLong, openSheet, addDays, dayNum, nowTime, r1 } = __m['js/ui.js'];
 
 let range = 90; // days shown, 0 means all
@@ -1407,7 +1412,7 @@ function weightChart(daily, days, height = 190) {
       { type: 'dots', color: COLORS.light, name: 'Daily', points: rows.map((r) => ({ x: dayNum(r.date), y: r.lb })) },
       { type: 'line', color: COLORS.blue, name: '7 day average', dots: false, points: avg.map((a) => ({ x: dayNum(a.date), y: a.avg })) },
     ],
-    fmt: (v) => v.toFixed(0),
+    fmt: autoFmt,
   });
 }
 
@@ -1417,7 +1422,7 @@ function waistChart(entries, height = 150) {
     height,
     xTicks: [],
     series: [{ type: 'line', color: COLORS.light, points: entries.map((w) => ({ x: dayNum(w.date), y: w.inches })) }],
-    fmt: (v) => v.toFixed(1),
+    fmt: (v, st) => v.toFixed(st >= 0.1 ? 1 : 2),
   });
 }
 
@@ -3244,7 +3249,7 @@ __m['js/screens/progress.js'] = (function () {
 // Progress tab: Lifts, Body, Food.
 const { getAll, put, dateStr, weekStart, parseDate } = __m['js/db.js'];
 const { liftData, dailyWeights, waistEntries, foodTotals, targetFor } = __m['js/stats.js'];
-const { chartSvg, COLORS } = __m['js/charts.js'];
+const { chartSvg, COLORS, autoFmt } = __m['js/charts.js'];
 const { weightChart, waistChart } = __m['js/screens/weight.js'];
 const { nextTarget } = __m['js/progression.js'];
 const { loadHistory, weekTargets, getRule } = __m['js/targets.js'];
@@ -3340,10 +3345,10 @@ async function liftsHtml() {
         <div class="small muted">Green bars met the goal.</div>
       </div>
       <div class="card"><h3>${assisted ? 'Assist per week (lower is better)' : 'Working weight per week'}</h3>
-        ${chartSvg({ height: 150, xTicks: ticks, invert: assisted, series: [{ type: 'line', color: COLORS.light, points: wPts }], fmt: (v) => v.toFixed(0), empty: 'No weighted sets yet.' })}
+        ${chartSvg({ height: 150, xTicks: ticks, invert: assisted, series: [{ type: 'line', color: COLORS.light, points: wPts }], fmt: autoFmt, empty: 'No weighted sets yet.' })}
       </div>
       ${ePts.length ? `<div class="card"><h3>Best estimated one rep max per week</h3>
-        ${chartSvg({ height: 150, xTicks: ticks, series: [{ type: 'line', color: COLORS.ok, points: ePts }], fmt: (v) => v.toFixed(0) })}</div>` : ''}
+        ${chartSvg({ height: 150, xTicks: ticks, series: [{ type: 'line', color: COLORS.ok, points: ePts }], fmt: autoFmt })}</div>` : ''}
       <div class="card"><h3>Every session</h3>
         ${sess.map((s) => `<div class="row"><div>${fmtDate(s.session.date)}</div><div class="scheme" style="text-align:right">${s.sets.map((x) => (x.weight ? `${fmtW(x.weight)} x ${x.reps}` : x.reps)).join(', ')}</div></div>`).join('') || '<div class="muted small">No sessions yet.</div>'}
       </div>`;
