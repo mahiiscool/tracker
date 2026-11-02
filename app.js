@@ -343,12 +343,24 @@ function stepWeight(w, ex, harder) {
 }
 
 // Heaviest weight (lowest assist for assisted) with at least one set that reached the bottom of the range.
-// If no set reached it, fall back to the heaviest weight used at all.
+// If no set reached it (for example a heavy test set, then lighter sets that were still short),
+// use the weight he did the most sets at, and break ties by total reps. That is where he really trained.
 function workingWeight(sets, repMin, kind) {
   const full = sets.filter((s) => s.reps >= repMin);
-  const pool = full.length ? full : sets;
-  const ws = pool.map((s) => s.weight ?? 0);
-  return kind === 'assisted' ? Math.min(...ws) : Math.max(...ws);
+  if (full.length) {
+    const ws = full.map((s) => s.weight ?? 0);
+    return kind === 'assisted' ? Math.min(...ws) : Math.max(...ws);
+  }
+  const by = new Map();
+  for (const s of sets) {
+    const w = s.weight ?? 0;
+    const g = by.get(w) || { w, n: 0, reps: 0 };
+    g.n += 1;
+    g.reps += s.reps || 0;
+    by.set(w, g);
+  }
+  const best = [...by.values()].sort((a, b) => b.n - a.n || b.reps - a.reps || (kind === 'assisted' ? a.w - b.w : b.w - a.w))[0];
+  return best.w;
 }
 
 // Did the sets at the working weight hit the top of the range?
