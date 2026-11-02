@@ -1682,6 +1682,149 @@ async function savePhoto(file) {
 return { photoUrl, savePhoto };
 })();
 
+/* ===== js/skip.js ===== */
+__m['js/skip.js'] = (function () {
+// Skip a training day: ask why, offer a mini workout, and log the choice.
+const { getAll, getAllByIndex, put, remove, getSetting, setSetting, dateStr, weekStart } = __m['js/db.js'];
+const { loadPlan } = __m['js/targets.js'];
+const { esc, openSheet } = __m['js/ui.js'];
+
+const REASONS = [
+  'Sick', 'Injured or sore', 'Tired', 'School', 'Work', 'No time', 'Gym closed or too busy', 'Other',
+];
+
+// Dips, chin ups and hanging knee raises: all bodyweight, all at the same station.
+const MINI_DEFAULT = ['dips', 'chinUp', 'hangingKneeRaise'];
+
+async function miniExerciseIds() {
+  const { exercises } = await loadPlan();
+  const saved = await getSetting('miniWorkout', null);
+  const ids = Array.isArray(saved) ? saved : MINI_DEFAULT;
+  return ids.filter((id) => exercises.has(id));
+}
+
+// One plan slot per mini exercise. A slot on the skipped day wins, otherwise the first one in the plan.
+async function miniSlots(day) {
+  const { exercises, slots } = await loadPlan();
+  const ids = await miniExerciseIds();
+  const out = [];
+  for (const id of ids) {
+    const pick = slots.find((s) => s.exerciseId === id && s.day === day) || slots.find((s) => s.exerciseId === id);
+    if (pick) out.push({ slot: pick, name: exercises.get(id).name });
+  }
+  return out;
+}
+
+async function findSession(day) {
+  const ws = weekStart();
+  const today = dateStr();
+  const mine = (await getAll('sessions')).filter((s) =>
+    !s.imported && s.day === day && (s.date === today || (!s.finishedAt && s.weekStart === ws)));
+  return mine.sort((a, b) => a.id - b.id).pop() || null;
+}
+
+async function clearSets(sessionId) {
+  for (const r of await getAllByIndex('sets', 'sessionId', sessionId)) await remove('sets', r.id);
+}
+
+// Log the skip. With mini = true the session stays open so the mini workout can be logged in it.
+async function recordSkip(day, reason, note, mini) {
+  const ws = weekStart();
+  let session = await findSession(day);
+  if (session) await clearSets(session.id); // only reachable while nothing is logged
+  const slots = mini ? (await miniSlots(day)).map((m) => m.slot.id) : [];
+  session = {
+    ...(session || {}),
+    date: dateStr(), day, weekStart: ws, startedAt: Date.now(),
+    finishedAt: mini ? null : Date.now(),
+    notes: '', exerciseNotes: {},
+    skipped: true, skipReason: reason, skipNote: note || '',
+    mini: !!mini, miniSlotIds: slots,
+  };
+  session.id = await put('sessions', session);
+  // A mini workout is real data, so it counts as the baseline week. A plain skip does not.
+  if (mini && !(await getSetting('baselineWeek', null))) await setSetting('baselineWeek', ws);
+  return session;
+}
+
+async function undoSkip(session) {
+  await clearSets(session.id);
+  await remove('sessions', session.id);
+}
+
+// Sheet 1 asks why. Sheet 2 offers the mini workout. onDone(session, wantsMini) runs after logging.
+async function openSkipSheet(day, dayTitle, onDone) {
+  const mini = await miniSlots(day);
+  const { root, close } = openSheet(`
+    <h2>Skip ${esc(dayTitle)}?</h2>
+    <p class="muted">Why are you skipping today?</p>
+    <div class="segs" id="reasons">
+      ${REASONS.map((r, i) => `<button class="seg ${i === 0 ? 'on' : ''}" data-act="reason" data-val="${esc(r)}">${esc(r)}</button>`).join('')}
+    </div>
+    <label class="field">Note (optional)<input id="skip-note" placeholder="Anything to remember"></label>
+    <button class="btn" data-act="next">Continue</button>
+    <button class="btn secondary" data-act="cancel">Cancel</button>`);
+  let reason = REASONS[0];
+  root.addEventListener('click', async (e) => {
+    const b = e.target.closest('[data-act]');
+    if (!b) return;
+    const act = b.dataset.act;
+    if (act === 'cancel') return close();
+    if (act === 'reason') {
+      reason = b.dataset.val;
+      root.querySelectorAll('[data-act=reason]').forEach((x) => x.classList.toggle('on', x === b));
+      return;
+    }
+    if (act === 'next') {
+      const note = root.querySelector('#skip-note').value.trim();
+      if (!mini.length) {
+        const s = await recordSkip(day, reason, note, false);
+        close();
+        return onDone(s, false);
+      }
+      root.innerHTML = `
+        <h2>Do a mini workout instead?</h2>
+        <p class="muted">Quick and short, just the key lifts:</p>
+        ${mini.map((m) => `<div class="row"><div class="name">${esc(m.name)}</div><div class="scheme">${m.slot.sets} x ${m.slot.repMin} to ${m.slot.repMax}</div></div>`).join('')}
+        <button class="btn" data-act="yes">Yes, start the mini workout</button>
+        <button class="btn secondary" data-act="no">No, just log the skip</button>`;
+      root.onclick = async (ev) => {
+        const a = ev.target.closest('[data-act]')?.dataset.act;
+        if (a !== 'yes' && a !== 'no') return;
+        const s = await recordSkip(day, reason, note, a === 'yes');
+        close();
+        onDone(s, a === 'yes');
+      };
+    }
+  });
+}
+
+// Settings: pick which exercises make up the mini workout.
+async function openMiniPicker(onDone) {
+  const { exercises } = await loadPlan();
+  const current = new Set(await miniExerciseIds());
+  const list = [...exercises.values()].sort((a, b) => a.name.localeCompare(b.name));
+  const { root, close } = openSheet(`
+    <h2>Mini workout</h2>
+    <p class="muted">What you can offer yourself on a skipped day. Keep it to three or four.</p>
+    ${list.map((x) => `<label class="check-line"><input type="checkbox" data-id="${esc(x.id)}" ${current.has(x.id) ? 'checked' : ''}> ${esc(x.name)}</label>`).join('')}
+    <button class="btn" data-act="save">Save</button>
+    <button class="btn secondary" data-act="cancel">Cancel</button>`);
+  root.addEventListener('click', async (e) => {
+    const act = e.target.closest('[data-act]')?.dataset.act;
+    if (act === 'cancel') return close();
+    if (act === 'save') {
+      const ids = [...root.querySelectorAll('input[data-id]')].filter((i) => i.checked).map((i) => i.dataset.id);
+      await setSetting('miniWorkout', ids);
+      close();
+      onDone();
+    }
+  });
+}
+
+return { REASONS, MINI_DEFAULT, miniExerciseIds, miniSlots, recordSkip, undoSkip, openSkipSheet, openMiniPicker };
+})();
+
 /* ===== js/screens/today.js ===== */
 __m['js/screens/today.js'] = (function () {
 const { getAll, getAllByIndex, getSetting, dayKey, dateStr, weekStart, parseDate } = __m['js/db.js'];
@@ -1695,6 +1838,7 @@ const { checkInStatus, computeCheckIn, applyDelta, saveCheckIn } = __m['js/check
 const { backupDue, exportJsonFile } = __m['js/backup.js'];
 const { savePhoto } = __m['js/photos.js'];
 const { esc } = __m['js/ui.js'];
+const { openSkipSheet } = __m['js/skip.js'];
 
 const GEAR = `<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>`;
 
@@ -1735,15 +1879,18 @@ async function render(el) {
     const sessions = (await getAll('sessions')).filter((s) =>
       !s.imported && s.day === key && (s.date === today || (!s.finishedAt && s.weekStart === ws)));
     const sess = sessions.sort((a, b) => a.id - b.id).pop();
-    const label = !n ? 'Add exercises' : !sess ? 'Start workout' : sess.finishedAt ? 'View summary' : 'Resume';
+    const skippedOnly = sess && sess.skipped && !sess.mini;
+    const label = !n ? 'Add exercises' : !sess ? 'Start workout' : skippedOnly ? 'View skipped day' : sess.finishedAt ? 'View summary' : 'Resume';
+    const skipNote = skippedOnly ? `Skipped today: ${esc(sess.skipReason || 'no reason')}. ` : '';
     const href = n ? `#/workout/${key}` : '#/settings';
     workout = `
       <div class="card">
         <h3>Today's workout</h3>
         <h2>${esc(info.title)}</h2>
         <div class="muted">${esc(info.subtitle || '')}</div>
-        <div class="small muted" style="margin-top:8px">${n} exercises. ${weekLine}.</div>
+        <div class="small muted" style="margin-top:8px">${skipNote}${n} exercises. ${weekLine}.</div>
         <a class="btn" href="${href}" style="text-decoration:none;text-align:center;line-height:52px">${label}</a>
+        ${n && !sess ? `<button class="link" data-act="skipday" data-day="${key}" style="display:block;margin:12px auto 0">Skip this day</button>` : ''}
       </div>`;
   } else {
     const next = nextTrainingDay(now, days.map((d) => d.key));
@@ -1850,6 +1997,13 @@ async function render(el) {
     if (act === 'autook') { await dismissAuto(); return render(el); }
     if (act === 'autoundo') { await undoAuto(today); return render(el); }
     if (act === 'notme') return friendSetupSheet();
+    if (act === 'skipday') {
+      const info = dmap.get(b.dataset.day);
+      return openSkipSheet(b.dataset.day, info.title, (session, mini) => {
+        if (mini) location.hash = `#/workout/${b.dataset.day}`;
+        else render(el);
+      });
+    }
     if (act === 'dismiss') { await saveCheckIn(checkCard, false); return render(el); }
   };
   el.onchange = async (e) => {
@@ -2076,6 +2230,7 @@ const { loadPlan, loadHistory, weekTargets, ensureWeekTargets, isBaselineWeek, s
 const { workingWeight, stepWeight, nextTarget, findBests } = __m['js/progression.js'];
 const { esc, fmtW, fmtDate, openSheet, CHECK } = __m['js/ui.js'];
 const { openAddExercise, removeSlot } = __m['js/plan.js'];
+const { openSkipSheet, undoSkip, miniSlots } = __m['js/skip.js'];
 
 let S = null;          // live session state
 let restHandle = null; // rest timer interval
@@ -2111,8 +2266,9 @@ function latest(arr) {
 
 function statusOf(session) {
   if (!session) return { text: '', label: 'Start workout' };
-  if (session.finishedAt) return { text: `Done ${fmtDate(session.date)}`, label: 'View summary' };
-  return { text: 'In progress', label: 'Resume' };
+  if (session.skipped && !session.mini) return { text: `Skipped, ${session.skipReason || 'no reason'}`, label: 'View' };
+  if (session.finishedAt) return { text: `${session.mini ? 'Mini workout done' : 'Done'} ${fmtDate(session.date)}`, label: 'View summary' };
+  return { text: session.mini ? 'Mini workout in progress' : 'In progress', label: 'Resume' };
 }
 
 /* ------------------------------------------------------------------ */
@@ -2237,12 +2393,16 @@ async function renderSession(el, day, dayList) {
   const today = dateStr();
   await ensureWeekTargets(ws);
   const { exercises, slots: all } = await loadPlan();
-  const slots = all.filter((s) => s.day === day);
 
+  // Today's session, an unfinished one from this week, or a finished one from earlier this week.
   const mine = (await getAll('sessions')).filter((s) =>
-    !s.imported && s.day === day && (s.date === today || (!s.finishedAt && s.weekStart === ws)));
+    !s.imported && s.day === day && (s.date === today || s.weekStart === ws));
   let session = latest(mine);
+  if (session && session.skipped && !session.mini && session.finishedAt) return renderSkipped(el, session, dayList);
   if (session && session.finishedAt) return renderSummary(el, session);
+  const slots = session && session.mini
+    ? session.miniSlotIds.map((id) => all.find((x) => x.id === id)).filter(Boolean)
+    : all.filter((s) => s.day === day);
   if (!session) {
     session = { date: today, day, weekStart: ws, startedAt: Date.now(), finishedAt: null, notes: '', exerciseNotes: {} };
     session.id = await put('sessions', session);
@@ -2313,11 +2473,12 @@ function draw() {
   const plan = S.dayInfo;
   el.innerHTML = `
     <a class="back" href="#/workout">Workout</a>
-    <div class="header"><h1>${esc(plan.title)}</h1><button class="chip" data-act="rest-cycle">${restLabel()}</button></div>
-    <p class="sub">${esc(plan.subtitle)}${S.baseline ? '. Baseline week, log what you lift.' : ''}</p>
+    <div class="header"><h1>${S.session.mini ? 'Mini workout' : esc(plan.title)}</h1><button class="chip" data-act="rest-cycle">${restLabel()}</button></div>
+    <p class="sub">${S.session.mini ? `Instead of ${esc(plan.title)}${S.session.skipReason ? ', skipped: ' + esc(S.session.skipReason) : ''}` : esc(plan.subtitle)}${S.baseline ? '. Baseline week, log what you lift.' : ''}</p>
     ${slots.length ? '' : '<div class="card"><h2>No exercises yet</h2><div class="muted">Add your first exercise below.</div></div>'}
     <div id="cards">${slots.map(cardHtml).join('')}</div>
-    <button class="btn secondary" data-act="addex">Add exercise</button>
+    ${S.session.mini ? '' : '<button class="btn secondary" data-act="addex">Add exercise</button>'}
+    ${!S.session.mini && !S.sets.some((r) => r.completed) ? '<button class="link" data-act="skipday" style="display:block;margin:14px auto">Skip this day</button>' : ''}
     <div id="sessionbar">
       <div id="restbar" hidden>
         <span id="resttxt"></span>
@@ -2436,7 +2597,7 @@ function cardHtml(slot) {
         <button class="link" data-act="addset" data-slot="${slot.id}">+ set</button>
         ${rows.length > 1 && !rows[rows.length - 1].completed ? `<button class="link" data-act="rmset" data-slot="${slot.id}">Remove last set</button>` : ''}
         <button class="link" data-act="notes" data-ex="${ex.id}">${note ? 'Note' : 'Add note'}</button>
-        <button class="link" data-act="rmex" data-slot="${slot.id}">Remove exercise</button>
+        ${S.session.mini ? '' : `<button class="link" data-act="rmex" data-slot="${slot.id}">Remove exercise</button>`}
       </div>
       ${noteOpen ? `<textarea class="note" data-note="${ex.id}" rows="2" placeholder="Note for this exercise">${esc(note)}</textarea>` : ''}
     </section>`;
@@ -2604,6 +2765,10 @@ async function onClick(e) {
     S.sets = S.sets.filter((r) => r.id !== last.id);
     return refreshCard(btn.dataset.slot);
   }
+  if (act === 'skipday') {
+    const { el, day, dayInfo } = S;
+    return openSkipSheet(day, dayInfo.title, async () => { stopRest(); S = null; renderSession(el, day, await getDays()); });
+  }
   if (act === 'rmex') {
     const slot = S.slots.find((x) => x.id === btn.dataset.slot);
     const mine = S.sets.filter((r) => r.slotId === slot.id);
@@ -2688,13 +2853,51 @@ async function finish() {
 }
 
 /* ------------------------------------------------------------------ */
+/* Skipped day                                                         */
+/* ------------------------------------------------------------------ */
+
+async function renderSkipped(el, session, dayList) {
+  const info = dayList.find((d) => d.key === session.day) || { title: 'Workout' };
+  const mini = await miniSlots(session.day);
+  el.innerHTML = `
+    <a class="back" href="#/today">Today</a>
+    <div class="header"><h1>Day skipped</h1></div>
+    <p class="sub">${esc(info.title)}, ${fmtDate(session.date)}</p>
+    <div class="card">
+      <h3>Reason</h3>
+      <div>${esc(session.skipReason || 'No reason given')}</div>
+      ${session.skipNote ? `<div class="muted small" style="margin-top:6px">${esc(session.skipNote)}</div>` : ''}
+      <div class="muted small" style="margin-top:8px">Nothing changes in your targets. Anything you skip carries forward to next time.</div>
+    </div>
+    ${mini.length ? '<button class="btn" data-act="domini">Do the mini workout now</button>' : ''}
+    <button class="btn secondary" data-act="undo">Undo skip and start the full workout</button>
+    <a class="btn secondary" href="#/today" style="text-decoration:none;text-align:center;line-height:52px">Done</a>`;
+  el.oninput = null; el.onchange = null;
+  el.onclick = async (e) => {
+    const act = e.target.closest('[data-act]')?.dataset.act;
+    if (act === 'undo') { await undoSkip(session); return renderSession(el, session.day, dayList); }
+    if (act === 'domini') {
+      session.mini = true;
+      session.miniSlotIds = mini.map((m) => m.slot.id);
+      session.finishedAt = null;
+      session.startedAt = Date.now();
+      await put('sessions', session);
+      if (!(await getSetting('baselineWeek', null))) await setSetting('baselineWeek', session.weekStart);
+      return renderSession(el, session.day, dayList);
+    }
+  };
+}
+
+/* ------------------------------------------------------------------ */
 /* Finish summary                                                      */
 /* ------------------------------------------------------------------ */
 
 async function renderSummary(el, session) {
   stopRest();
   const { exercises, slots: all } = await loadPlan();
-  const slots = all.filter((s) => s.day === session.day);
+  const slots = session.mini
+    ? session.miniSlotIds.map((id) => all.find((x) => x.id === id)).filter(Boolean)
+    : all.filter((s) => s.day === session.day);
   const sets = (await getAllByIndex('sets', 'sessionId', session.id)).filter((s) => s.completed && s.reps > 0);
   const ws = session.weekStart || weekStart(parseDate(session.date));
   const targets = await weekTargets(ws);
@@ -2763,8 +2966,8 @@ async function renderSummary(el, session) {
   el.onchange = null;
   el.innerHTML = `
     <a class="back" href="#/today">Today</a>
-    <div class="header"><h1>Workout done</h1></div>
-    <p class="sub">${esc(dayInfo.title)}, ${fmtDate(session.date)}</p>
+    <div class="header"><h1>${session.mini ? 'Mini workout done' : 'Workout done'}</h1></div>
+    <p class="sub">${session.mini ? `Instead of ${esc(dayInfo.title)}${session.skipReason ? ', skipped: ' + esc(session.skipReason) : ''}` : esc(dayInfo.title)}, ${fmtDate(session.date)}</p>
     <div class="card stats">
       <div><b>${totalReps}</b><span>reps</span></div>
       <div><b>${Math.round(volume).toLocaleString()}</b><span>lb volume</span></div>
@@ -3285,6 +3488,7 @@ const { dailyWeights } = __m['js/stats.js'];
 const { friendSetupSheet } = __m['js/screens/setup.js'];
 const { steadyWeight } = __m['js/autotargets.js'];
 const { esc, fmtW, openSheet } = __m['js/ui.js'];
+const { openMiniPicker, miniSlots } = __m['js/skip.js'];
 const { openAddExercise, openEditSlot } = __m['js/plan.js'];
 const { targetFor } = __m['js/stats.js'];
 const { exportAll, countsOf, importAll, resetAll, resetProgress, csvOf, shareOrDownload, exportJsonFile } = __m['js/backup.js'];
@@ -3359,6 +3563,7 @@ async function render(el) {
     counts.push(`<div class="row"><div>${name}</div><div class="scheme">${await count(name)}</div></div>`);
   }
 
+  const miniNames = (await miniSlots(dayList[0] ? dayList[0].key : 'mon')).map((m) => m.name);
   const seg = (name, val, label, cur) => `<button class="seg ${val === cur ? 'on' : ''}" data-act="${name}" data-val="${val}">${label}</button>`;
 
   el.innerHTML = `
@@ -3412,6 +3617,12 @@ async function render(el) {
       </div>
     </div>
 
+    <div class="card">
+      <h3>Mini workout</h3>
+      <div class="small muted">Offered when you skip a training day. ${miniNames.length ? esc(miniNames.join(', ')) + '.' : 'None picked yet.'}</div>
+      <button class="btn secondary" data-act="minipick">Change mini workout</button>
+    </div>
+
     <p class="sub" style="margin-top:16px">Your plan. Tap an exercise to edit it, reorder it or remove it. Add anything new at the bottom of each day.</p>
     ${planHtml}
 
@@ -3458,6 +3669,7 @@ async function render(el) {
     if (act === 'reset') return resetSheet();
     if (act === 'resetprog') return resetProgressSheet();
     if (act === 'notme') return friendSetupSheet();
+    if (act === 'minipick') return openMiniPicker(again);
   };
   el.onchange = async (e) => {
     if (e.target.dataset.act === 'water') { await setSetting('waterOn', e.target.checked); return; }
