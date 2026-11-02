@@ -619,18 +619,29 @@ async function ensureWeekTargets(ws = weekStart()) {
     const hist = (byExercise.get(slot.exerciseId) || []).filter((h) => !h.session.imported && h.session.date);
     const lastWeek = hist.filter((h) => weekStart(parseDate(h.session.date)) === prevWeek);
     const last = lastWeek[lastWeek.length - 1];
+    const earlier = allRows.filter((r) => r.slotId === slot.id && r.weekStart < ws)
+      .sort((a, b) => b.weekStart.localeCompare(a.weekStart))[0];
+    // Newest session of this exercise before this week, even if it was more than a week ago.
+    const older = hist.filter((h) => weekStart(parseDate(h.session.date)) < ws);
+    const newest = older[older.length - 1];
     let t;
-    if (last) {
-      const idx = hist.indexOf(last);
+    const progress = (entry) => {
+      const idx = hist.indexOf(entry);
       const prev = idx > 0 ? hist[idx - 1] : null;
-      t = nextTarget({ slot, ex, lastSets: last.sets, prevSets: prev ? prev.sets : [], rule });
-    } else {
+      return nextTarget({ slot, ex, lastSets: entry.sets, prevSets: prev ? prev.sets : [], rule });
+    };
+    if (last) {
+      t = progress(last);
+    } else if (earlier) {
       // Missed exercise or missed week: carry the newest earlier target forward unchanged.
-      const earlier = allRows.filter((r) => r.slotId === slot.id && r.weekStart < ws)
-        .sort((a, b) => b.weekStart.localeCompare(a.weekStart))[0];
-      t = earlier
-        ? { targetWeight: earlier.targetWeight, targetReps: earlier.targetReps, totalRepGoal: earlier.totalRepGoal, suggestion: null, note: 'Carried forward' }
-        : firstTarget(slot);
+      t = { targetWeight: earlier.targetWeight, targetReps: earlier.targetReps, totalRepGoal: earlier.totalRepGoal, suggestion: null, note: 'Carried forward' };
+    } else if (newest) {
+      // Never had a target (for example a whole week was skipped right after the baseline week):
+      // build it from what he actually lifted last time.
+      t = progress(newest);
+    } else {
+      // Never logged this exercise (missed it all through the baseline week): start from the plan.
+      t = firstTarget(slot);
     }
     out.push({ weekStart: ws, slotId: slot.id, exerciseId: slot.exerciseId, overridden: false, ...t });
   }
