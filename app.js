@@ -3033,6 +3033,7 @@ const { esc, fmtLong, openSheet, addDays, nowTime } = __m['js/ui.js'];
 const { getDays } = __m['js/seed.js'];
 
 let viewDate = null; // lets you log for another day when you forgot
+let viewBase = null; // the real "today" when viewDate was set, so a new day resets the view
 
 const n0 = (v) => Math.round(v || 0);
 const num = (v) => { const x = parseFloat(String(v).replace(',', '.')); return Number.isNaN(x) ? null : x; };
@@ -3059,7 +3060,7 @@ function ring(value, goal, label, unit) {
 
 async function render(el) {
   const today = dateStr();
-  if (!viewDate) viewDate = today;
+  if (!viewDate || viewBase !== today) { viewDate = today; viewBase = today; }
   const date = viewDate;
   const entries = (await getAllByIndex('foodEntries', 'date', date)).sort((a, b) => (a.time || '').localeCompare(b.time || '') || a.id - b.id);
   const presets = (await getAll('foodPresets')).sort((a, b) => a.sortOrder - b.sortOrder);
@@ -3188,10 +3189,25 @@ async function render(el) {
     }
     if (act === 'newpreset') return editPreset(null, () => render(el));
     if (act === 'repeat') {
-      for (const y of await getAllByIndex('foodEntries', 'date', addDays(date, -1))) {
-        await log({ name: y.name, kcal: y.kcal, protein: y.protein, carbs: y.carbs, fat: y.fat, presetId: y.presetId });
-      }
-      return render(el);
+      const prev = await getAllByIndex('foodEntries', 'date', addDays(date, -1));
+      const k = prev.reduce((a, y) => a + (y.kcal || 0), 0);
+      const p = prev.reduce((a, y) => a + (y.protein || 0), 0);
+      const { root, close } = openSheet(`
+        <h2>Copy yesterday?</h2>
+        <div class="muted small">This copies ${prev.length} ${prev.length === 1 ? "entry" : "entries"} (${n0(k)} kcal, ${n0(p)} g protein) into ${date === today ? 'today' : esc(fmtLong(date))}.</div>
+        <button class="btn" data-act="yes">Yes, copy them</button>
+        <button class="btn secondary" data-act="cancel">Cancel</button>`);
+      root.addEventListener('click', async (ev) => {
+        const a = ev.target.closest('[data-act]')?.dataset.act;
+        if (!a) return;
+        if (a === 'cancel') return close();
+        if (a === 'yes') {
+          for (const y of prev) await log({ name: y.name, kcal: y.kcal, protein: y.protein, carbs: y.carbs, fat: y.fat, presetId: y.presetId });
+          close();
+          render(el);
+        }
+      });
+      return;
     }
     if (act === 'edit') return editEntry(entries.find((x) => x.id === Number(btn.dataset.id)), () => render(el));
   };
