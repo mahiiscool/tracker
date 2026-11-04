@@ -985,7 +985,7 @@ return { GOALS, ACTIVITY, suggestTargets, checkInCases };
 __m['js/backup.js'] = (function () {
 // Export, import and CSV. Everything lives on this phone, so a backup file is the safety net.
 const { PLAN_VERSION } = __m['js/seed.js'];
-const { getAll, clear, remove, putMany, getSetting, setSetting, dateStr, STORE_NAMES } = __m['js/db.js'];
+const { openDB, getAll, clear, remove, putMany, getSetting, setSetting, dateStr, STORE_NAMES } = __m['js/db.js'];
 
 const blobToDataUrl = (blob) => new Promise((res, rej) => {
   const r = new FileReader();
@@ -1015,16 +1015,32 @@ function countsOf(data) {
   return o;
 }
 
+// All or nothing: everything is prepared first, then every store is cleared and refilled in ONE
+// transaction. If anything fails part way (a bad row, phone storage full), the database rolls back
+// and the data that was on the phone is still there.
 async function importAll(data) {
   if (!data || data.app !== 'tracker' || !data.stores) throw new Error('This is not a tracker backup file.');
+  const prepared = {};
   for (const name of STORE_NAMES) {
-    await clear(name);
     let rows = data.stores[name] || [];
+    if (!Array.isArray(rows)) throw new Error(`The backup's ${name} table is damaged.`);
     if (name === 'photos') {
       rows = await Promise.all(rows.map(async (p) => ({ ...p, blob: p.blob ? await dataUrlToBlob(p.blob) : null })));
     }
-    if (rows.length) await putMany(name, rows);
+    prepared[name] = rows;
   }
+  const db = await openDB();
+  await new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAMES, 'readwrite');
+    for (const name of STORE_NAMES) {
+      const os = tx.objectStore(name);
+      os.clear();
+      for (const row of prepared[name]) os.put(row);
+    }
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error || new Error('Import failed. Nothing was changed.'));
+    tx.onabort = () => reject(tx.error || new Error('Import failed. Nothing was changed.'));
+  });
 }
 
 // Clears the logs you pick. The plan, exercises, presets and settings stay.
@@ -1319,7 +1335,8 @@ function chartSvg({ height = 180, series, xTicks = [], yMin = null, yMax = null,
     const col = s.color || C.blue;
     const sorted = [...s.points].sort((a, b) => a.x - b.x);
     if (s.type === 'bars') {
-      const bw = Math.max(3, (minDelta / (x1 - x0)) * pw * 0.6);
+      // Capped so a single week or day of data is a bar, not half the chart.
+      const bw = Math.min(28, Math.max(3, (minDelta / (x1 - x0)) * pw * 0.6));
       const base = Y(Math.max(lo, 0));
       for (const p of sorted) {
         const y = Y(p.y);
@@ -1489,7 +1506,9 @@ async function render(el) {
     if (act === 'save-waist') {
       const v = parseFloat(String(el.querySelector('#waist').value).replace(',', '.'));
       if (!(v > 10 && v < 100)) return el.querySelector('#waist').classList.add('shake');
-      await put('waist', { date: today, inches: Math.round(v * 100) / 100 });
+      // Saving twice on the same day corrects today's entry instead of adding a second one.
+      const same = waist.find((w) => w.date === today);
+      await put('waist', { ...(same || {}), date: today, inches: Math.round(v * 100) / 100 });
       return render(el);
     }
     if (act === 'edit-weight') {
@@ -1895,7 +1914,12 @@ async function render(el) {
     const n = allSlots.filter((s) => s.day === key).length;
     const sessions = (await getAll('sessions')).filter((s) =>
       !s.imported && s.day === key && (s.date === today || (!s.finishedAt && s.weekStart === ws)));
-    const sess = sessions.sort((a, b) => a.id - b.id).pop();
+    let sess = sessions.sort((a, b) => a.id - b.id).pop();
+    // A workout that was only opened, with nothing logged, has not really started.
+    if (sess && !sess.skipped && !sess.finishedAt) {
+      const logged = (await getAllByIndex('sets', 'sessionId', sess.id)).some((r) => r.completed);
+      if (!logged) sess = undefined;
+    }
     const skippedOnly = sess && sess.skipped && !sess.mini;
     const label = !n ? 'Add exercises' : !sess ? 'Start workout' : skippedOnly ? 'View skipped day' : sess.finishedAt ? 'View summary' : 'Resume';
     const skipNote = skippedOnly ? `Skipped today: ${esc(sess.skipReason || 'no reason')}. ` : '';
@@ -2298,7 +2322,10 @@ async function renderList(el, dayList) {
   const { exercises, slots } = await loadPlan();
   const targets = await weekTargets(ws);
   const baseline = await isBaselineWeek(ws);
-  const sessions = await sessionsThisWeek(ws);
+  const opened = await sessionsThisWeek(ws);
+  // Sessions that were only opened (nothing logged, not skipped, not finished) do not count as started.
+  const loggedIds = new Set((await getAll('sets')).filter((r) => r.completed).map((r) => r.sessionId));
+  const sessions = opened.filter((s) => s.skipped || s.finishedAt || loggedIds.has(s.id));
   const today = dayKey();
 
   let goal = 0;
@@ -2423,7 +2450,15 @@ async function renderSession(el, day, dayList) {
   if (!session) {
     session = { date: today, day, weekStart: ws, startedAt: Date.now(), finishedAt: null, notes: '', exerciseNotes: {} };
     session.id = await put('sessions', session);
-    if (!(await getSetting('baselineWeek', null))) await setSetting('baselineWeek', ws);
+  } else if (session.date !== today && !session.skipped) {
+    // Opened earlier just to look (for example Wednesday's card on Monday) and nothing logged yet:
+    // the workout really happens today, so date it today.
+    const logged = (await getAllByIndex('sets', 'sessionId', session.id)).some((r) => r.completed);
+    if (!logged) {
+      session.date = today;
+      session.startedAt = Date.now();
+      await put('sessions', session);
+    }
   }
   if (!session.exerciseNotes) session.exerciseNotes = {};
 
@@ -2708,6 +2743,11 @@ async function toggleCheck(rowEl) {
   row.partials = pInput ? int(pInput.value) : null;
   row.completed = true;
   await put('sets', row);
+  // The baseline week is the first week a set is actually logged, not the first week a workout was opened.
+  if (!(await getSetting('baselineWeek', null))) {
+    await setSetting('baselineWeek', S.ws);
+    S.baseline = true;
+  }
   refreshCard(row.slotId);
   updateTotal();
   startRest();
@@ -3117,7 +3157,7 @@ async function render(el) {
         ${presets.map((p) => `
           <button class="preset" data-act="preset" data-id="${p.id}">
             <b>${esc(p.name)}</b>
-            <span>${p.kcal != null ? n0(p.kcal) + ' kcal' : 'tap to set'}${p.protein != null ? ', ' + n0(p.protein) + ' g' : ''}</span>
+            <span>${p.kcal != null ? n0(p.kcal) + ' kcal' : 'tap to set'}${p.protein != null ? ', ' + n0(p.protein) + ' g' : p.kcal != null ? ', tap to add protein' : ''}</span>
           </button>`).join('') || '<div class="muted small">No presets yet.</div>'}
       </div>
       <div class="small muted" style="margin-top:8px">Long press a preset to edit it.</div>
@@ -3140,18 +3180,29 @@ async function render(el) {
       </div>
     </details>`;
 
+  // Long press opens the editor. firedAt swallows only the tap that ends that same long press,
+  // so cancelling the editor never eats your next real tap.
   let pressTimer = null;
+  let firedAt = 0;
   const presetEl = (t) => t.closest('[data-act="preset"]');
+  const openEdit = (b) => {
+    firedAt = Date.now();
+    editPreset(presets.find((p) => p.id === Number(b.dataset.id)), () => render(el));
+  };
+  const cancelPress = () => { clearTimeout(pressTimer); pressTimer = null; };
   el.ontouchstart = (e) => {
+    cancelPress();
     const b = presetEl(e.target);
     if (!b) return;
-    pressTimer = setTimeout(() => { pressTimer = 'fired'; editPreset(presets.find((p) => p.id === Number(b.dataset.id)), () => render(el)); }, 550);
+    pressTimer = setTimeout(() => { pressTimer = null; openEdit(b); }, 550);
   };
-  el.ontouchend = () => { if (pressTimer && pressTimer !== 'fired') clearTimeout(pressTimer); };
-  el.ontouchmove = () => { if (pressTimer && pressTimer !== 'fired') clearTimeout(pressTimer); };
+  el.ontouchend = cancelPress;
+  el.ontouchmove = cancelPress;
   el.oncontextmenu = (e) => {
     const b = presetEl(e.target);
-    if (b) { e.preventDefault(); editPreset(presets.find((p) => p.id === Number(b.dataset.id)), () => render(el)); }
+    if (!b) return;
+    e.preventDefault();
+    if (Date.now() - firedAt > 800) openEdit(b);
   };
 
   el.onchange = async (e) => {
@@ -3161,7 +3212,7 @@ async function render(el) {
   el.onclick = async (e) => {
     const btn = e.target.closest('[data-act]');
     if (!btn) return;
-    if (pressTimer === 'fired') { pressTimer = null; return; }
+    if (Date.now() - firedAt < 800) return;
     const act = btn.dataset.act;
     const log = async (o) => {
       await put('foodEntries', { date, time: nowTime(), name: o.name || '', kcal: o.kcal || 0, protein: o.protein || 0, carbs: o.carbs || 0, fat: o.fat || 0, presetId: o.presetId ?? null });
@@ -3185,7 +3236,8 @@ async function render(el) {
     }
     if (act === 'preset') {
       const p = presets.find((x) => x.id === Number(btn.dataset.id));
-      if (p.kcal == null) return editPreset(p, () => render(el), true);
+      // Blank numbers (the starting presets have no protein yet) get filled in once, on first use.
+      if (p.kcal == null || p.protein == null) return editPreset(p, () => render(el), true);
       await log({ ...p, presetId: p.id });
       return render(el);
     }
@@ -3283,6 +3335,8 @@ function editPreset(p, done, logAfter = false) {
       if (!o.name) return root.querySelector('#f-name').classList.add('shake');
       const all = await getAll('foodPresets');
       const saved = { ...row, ...o, sortOrder: p ? p.sortOrder : all.length };
+      // Logged from a blank preset: a field left empty means 0, so it does not ask again next time.
+      if (logAfter) { saved.kcal = saved.kcal ?? 0; saved.protein = saved.protein ?? 0; }
       const id = await put('foodPresets', saved);
       if (logAfter) {
         await put('foodEntries', { date: viewDate || dateStr(), time: nowTime(), name: o.name, kcal: o.kcal || 0, protein: o.protein || 0, carbs: o.carbs || 0, fat: o.fat || 0, presetId: id });
@@ -3315,6 +3369,19 @@ let filter = '';
 let range = 90;
 let photoA = null;
 let photoB = null;
+let pickData = null; // exercise list for the search box
+
+// Exercise picker options, filtered by the search box and grouped by day.
+// If the chosen exercise is filtered out, a first "matches" line keeps the charts where they are.
+function pickOptions(all, dayOf) {
+  const list = all.filter((e) => e.name.toLowerCase().includes(filter.toLowerCase()));
+  const groups = {};
+  for (const e of list) (groups[dayOf.get(e.id) || 'other'] ||= []).push(e);
+  const hidden = !list.some((e) => e.id === exId);
+  const head = hidden ? `<option value="" selected disabled>${list.length} ${list.length === 1 ? 'match' : 'matches'}, pick one</option>` : '';
+  return head + Object.entries(groups).map(([d, items]) =>
+    `<optgroup label="${DAY_NAMES[d] || 'Other'}">${items.map((e) => `<option value="${e.id}" ${e.id === exId ? 'selected' : ''}>${esc(e.name)}</option>`).join('')}</optgroup>`).join('');
+}
 
 const weekTicks = (weeks) => {
   const step = Math.max(1, Math.ceil(weeks.length / 5));
@@ -3333,10 +3400,13 @@ async function render(el) {
   else body = await foodHtml();
   el.innerHTML = head + body;
 
+  // Typing in the search box only rebuilds the exercise list. Re-rendering the whole screen
+  // would replace the box and the iPhone keyboard would close after every letter.
   el.oninput = (e) => {
     if (e.target.id === 'ex-filter') {
       filter = e.target.value;
-      render(el).then(() => { const f = el.querySelector('#ex-filter'); if (f) { f.focus(); f.setSelectionRange(filter.length, filter.length); } });
+      const pick = el.querySelector('#ex-pick');
+      if (pick && pickData) pick.innerHTML = pickOptions(pickData.all, pickData.dayOf);
     }
   };
   el.onchange = (e) => {
@@ -3357,17 +3427,14 @@ async function liftsHtml() {
   const { exercises, slots, weekly, goals, sessionsByEx, sessions } = await liftData();
   const withData = [...weekly.keys()];
   const all = [...exercises.values()].sort((a, b) => a.name.localeCompare(b.name));
-  const list = all.filter((e) => e.name.toLowerCase().includes(filter.toLowerCase()));
   if (!exId || !exercises.has(exId)) exId = withData[0] || (all[0] && all[0].id);
   const ex = exercises.get(exId);
 
   // Group by the day each exercise first appears on.
   const dayOf = new Map();
   for (const s of slots.sort((a, b) => a.order - b.order)) if (!dayOf.has(s.exerciseId)) dayOf.set(s.exerciseId, s.day);
-  const groups = {};
-  for (const e of list) (groups[dayOf.get(e.id) || 'other'] ||= []).push(e);
-  const opts = Object.entries(groups).map(([d, items]) =>
-    `<optgroup label="${DAY_NAMES[d] || 'Other'}">${items.map((e) => `<option value="${e.id}" ${e.id === exId ? 'selected' : ''}>${esc(e.name)}</option>`).join('')}</optgroup>`).join('');
+  pickData = { all, dayOf };
+  const opts = pickOptions(all, dayOf);
 
   let charts = '<div class="card"><div class="muted">Pick an exercise with logged sets.</div></div>';
   if (ex) {
@@ -3790,7 +3857,7 @@ async function importSheet(file) {
     const act = e.target.closest('[data-act]')?.dataset.act;
     if (act === 'cancel') return close();
     if (act !== 'go') return;
-    try { await importAll(data); } catch (err) { return alert(String(err.message || err)); }
+    try { await importAll(data); } catch (err) { return alert(`Import failed. Nothing on this phone was changed.\n\n${err.message || err}`); }
     close();
     location.hash = '#/today';
     location.reload();
@@ -3907,7 +3974,8 @@ return { render };
 /* ===== js/app.js ===== */
 __m['js/app.js'] = (function () {
 // Router, tab bar and boot.
-const { openDB, getSetting } = __m['js/db.js'];
+const { openDB, getSetting, dateStr } = __m['js/db.js'];
+const { esc } = __m['js/ui.js'];
 const { seedIfEmpty, migratePlan } = __m['js/seed.js'];
 const { ensureWeekTargets } = __m['js/targets.js'];
 const today = __m['js/screens/today.js'];
@@ -3937,14 +4005,26 @@ async function route() {
   app.onchange = null;
   app.oninput = null;
   app.ontouchstart = app.ontouchend = app.ontouchmove = app.oncontextmenu = null;
+  renderedDay = dateStr();
+  // A sheet left open from the last screen (for example after a failed import) would cover the new one.
+  document.querySelectorAll('.sheet-backdrop').forEach((s) => s.remove());
   try {
     await screen.render(app, arg);
   } catch (err) {
-    app.innerHTML = `<div class="card"><h2>Something went wrong</h2><div class="muted small">${String(err)}</div></div>`;
+    app.innerHTML = `<div class="card"><h2>Something went wrong</h2><div class="muted small">${esc(String(err))}</div></div>`;
     console.error(err);
   }
   window.scrollTo(0, 0);
 }
+
+// iPhone keeps the app in memory overnight. When it comes back on a new day, redraw so Today shows
+// the new date and an empty weigh in. A workout in progress is left alone.
+let renderedDay = null;
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden || !renderedDay || renderedDay === dateStr()) return;
+  if (app.classList.contains('has-bar')) return;
+  route();
+});
 
 async function boot() {
   try {
