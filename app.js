@@ -2691,8 +2691,8 @@ async function toggleCheck(rowEl) {
   if (wInput && ex.kind !== 'bodyweight' && weight === null) return flash(wInput);
 
   let reps = int(rInput.value);
-  // You tapped F and left reps empty: log it as a set to failure with the reps lost.
-  const lost = reps === null && row.failure && row.failureUser;
+  // F is lit (tapped, or on by default for AMRAP sets) and reps are empty: log a set to failure with the reps lost.
+  const lost = reps === null && row.failure;
   if (reps === null && !lost) {
     // One tap logs the target reps, but only when the weight matches the target.
     const tgt = S.targets.get(slot.id);
