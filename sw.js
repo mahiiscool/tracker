@@ -1,7 +1,7 @@
 // Service worker: caches every app file so the app opens with no signal.
 // To ship an update, bump VERSION. Old caches are deleted on activate.
 // Bump this number every time you push a change. Phones then show "Update available".
-const VERSION = 'v15';
+const VERSION = 'v16';
 const CACHE = 'tracker-' + VERSION;
 
 const ASSETS = [
@@ -17,7 +17,9 @@ const ASSETS = [
 
 self.addEventListener('install', (event) => {
   event.waitUntil(
-    caches.open(CACHE).then((cache) => cache.addAll(ASSETS))
+    // cache: 'reload' skips the browser's own HTTP cache. GitHub Pages lets browsers keep files
+    // for 10 minutes, so without this a new version could get cached with the old app.js inside.
+    caches.open(CACHE).then((cache) => cache.addAll(ASSETS.map((u) => new Request(u, { cache: 'reload' }))))
   );
 });
 
