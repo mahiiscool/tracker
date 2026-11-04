@@ -2517,6 +2517,8 @@ function moveUpBanner(slot, ex, rows) {
   for (const r of rows) {
     if (!r.completed || !(r.reps > 0) || r.reps < slot.repMax) continue;
     const w = r.weight ?? 0;
+    // Plain bodyweight has no weight to move up from. Adding weight is your call (+ added weight).
+    if (ex.kind === 'bodyweight' && !(w > 0)) continue;
     if (rows.some((x) => x.setNumber < r.setNumber && x.completed && (x.weight ?? 0) === w)) continue;
     const later = rows.filter((x) => x.setNumber > r.setNumber && !x.completed && (x.weight ?? 0) === w);
     if (!later.length) continue;
