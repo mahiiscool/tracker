@@ -830,20 +830,22 @@ return { dailyWeights, avgWindow, movingAvg, waistEntries, targetFor, foodTotals
 __m['js/autotargets.js'] = (function () {
 // Targets that follow body weight, without touching your goals.
 //
-// Protein: target = ratio x body weight, where the ratio is your own current target divided by
-// your current weight (for example 160 g / 182 lb = 0.88 g per lb). It moves in steps of 5 g, at most
-// once a week, and never leaves 0.75 to 1.1 g per lb.
+// Protein: follows your morning weigh in every day. target = ratio x latest weigh in, where the ratio
+// is your own target divided by your weight when you last set it (for example 160 g / 182 lb =
+// 0.88 g per lb). Rounded to the gram. A second weigh in on the same day corrects that day's target
+// instead of adding another one. Every screen reads the same dated target, so the Food rings, Today,
+// the Progress charts and check ins all use it.
 //
 // Calories: OFF by default. Your check in already adds or removes calories from the weight and waist
 // trend. Scaling calories with weight at the same time would fight it, because the check in adds
-// calories exactly when your weight drops.
-const { getSetting, setSetting, put, remove, dateStr } = __m['js/db.js'];
+// calories exactly when your weight drops. When on, it uses the 7 day average, at most once a week.
+const { getAll, getSetting, setSetting, put, remove, dateStr } = __m['js/db.js'];
 const { dailyWeights, targetFor } = __m['js/stats.js'];
 const { addDays, diffDays, mean } = __m['js/ui.js'];
 
-const r5 = (x) => Math.round(x / 5) * 5;
 const r50 = (x) => Math.round(x / 50) * 50;
 const r1 = (x) => Math.round(x * 10) / 10;
+const carbsFor = (kcal, protein, fat) => Math.max(0, Math.round((kcal - protein * 4 - fat * 9) / 4));
 
 const SETTINGS = { autoProtein: true, autoKcal: false };
 
@@ -854,58 +856,79 @@ async function steadyWeight(today = dateStr()) {
   return recent.length >= 3 ? mean(recent.map((d) => d.lb)) : null;
 }
 
+// Most recent weigh in on or before today: { date, lb } or null.
+async function latestWeight(today = dateStr()) {
+  const daily = (await dailyWeights()).filter((d) => d.date <= today);
+  return daily.length ? daily[daily.length - 1] : null;
+}
+
 // Call after you change a target on purpose. The new numbers become the ratio to follow.
 async function rebaseline(today = dateStr()) {
-  const w = await steadyWeight(today);
-  if (!w) { await remove('settings', 'proteinPerLb'); await remove('settings', 'kcalPerLb'); return; }
+  const lw = await latestWeight(today);
+  const sw = await steadyWeight(today);
   const t = await targetFor(today);
-  await setSetting('proteinPerLb', t.protein / w);
-  await setSetting('kcalPerLb', t.kcal / w);
+  if (lw) await setSetting('proteinPerLb', t.protein / lw.lb); else await remove('settings', 'proteinPerLb');
+  if (sw) await setSetting('kcalPerLb', t.kcal / sw); else await remove('settings', 'kcalPerLb');
   await setSetting('autoLast', today);
+}
+
+// Today's auto row is corrected in place, so there is at most one auto change per day.
+async function saveTarget(today, row) {
+  const rows = (await getAll('nutritionTargets')).sort((a, b) => a.effectiveDate.localeCompare(b.effectiveDate) || a.id - b.id);
+  const last = rows[rows.length - 1];
+  const reuse = last && last.effectiveDate === today && String(last.reason || '').startsWith('Auto');
+  await put('nutritionTargets', { ...(reuse ? { id: last.id } : {}), effectiveDate: today, ...row });
 }
 
 async function maybeAutoAdjust(today = dateStr()) {
   const autoProtein = await getSetting('autoProtein', SETTINGS.autoProtein);
   const autoKcal = await getSetting('autoKcal', SETTINGS.autoKcal);
   if (!autoProtein && !autoKcal) return null;
-  const w = await steadyWeight(today);
-  if (!w) return null;
   const t = await targetFor(today);
-
-  const ppl = await getSetting('proteinPerLb', null);
-  const kpl = await getSetting('kcalPerLb', null);
-  if (ppl === null || kpl === null) { await rebaseline(today); return null; }
-
-  const last = await getSetting('autoLast', null);
-  if (last && diffDays(last, today) < 7) return null;
-  await setSetting('autoLast', today);
-
   let protein = t.protein;
   let kcal = t.kcal;
-  if (autoProtein) {
-    const p = Math.min(Math.max(r5(ppl * w), Math.round(0.75 * w)), Math.round(1.1 * w));
-    if (Math.abs(p - t.protein) >= 5) protein = p;
-  }
-  if (autoKcal) {
-    const k = r50(kpl * w);
-    if (Math.abs(k - t.kcal) >= 50) kcal = k;
-  }
-  if (protein === t.protein && kcal === t.kcal) return null;
+  let change = null;
 
-  const carbs = Math.max(0, Math.round((kcal - protein * 4 - t.fat * 9) / 4));
-  await put('nutritionTargets', {
-    effectiveDate: today, kcal, protein, fat: t.fat, carbs, reason: `Auto, body weight ${r1(w)} lb`,
+  // Protein: every day, from the latest weigh in.
+  const lw = await latestWeight(today);
+  if (autoProtein && lw) {
+    const ppl = await getSetting('proteinPerLb', null);
+    if (ppl === null) await setSetting('proteinPerLb', t.protein / lw.lb);
+    else protein = Math.round(ppl * lw.lb);
+  }
+
+  // Calories: once a week, from the 7 day average.
+  if (autoKcal) {
+    const sw = await steadyWeight(today);
+    const kpl = await getSetting('kcalPerLb', null);
+    const last = await getSetting('autoLast', null);
+    if (sw && kpl === null) await setSetting('kcalPerLb', t.kcal / sw);
+    else if (sw && !(last && diffDays(last, today) < 7)) {
+      await setSetting('autoLast', today);
+      const k = r50(kpl * sw);
+      if (Math.abs(k - t.kcal) >= 50) {
+        kcal = k;
+        change = { date: today, weight: r1(sw), from: { kcal: t.kcal }, to: { kcal } };
+      }
+    }
+  }
+
+  if (protein === t.protein && kcal === t.kcal) return null;
+  await saveTarget(today, {
+    kcal, protein, fat: t.fat, carbs: carbsFor(kcal, protein, t.fat),
+    reason: `Auto, body weight ${r1(lw ? lw.lb : 0)} lb`,
   });
-  const change = { date: today, weight: r1(w), from: { kcal: t.kcal, protein: t.protein, fat: t.fat, carbs: t.carbs }, to: { kcal, protein } };
-  await setSetting('autoUndo', change);
+  if (change) await setSetting('autoUndo', change); // only calorie moves get a notice
   return change;
 }
 
-// Put the old numbers back and stop following weight.
+// Put the old calories back and stop following weight. Protein keeps today's number.
 async function undoAuto(today = dateStr()) {
   const c = await getSetting('autoUndo', null);
   if (!c) return;
-  await put('nutritionTargets', { effectiveDate: today, ...c.from, reason: 'Undo auto change' });
+  const t = await targetFor(today);
+  const kcal = c.from.kcal;
+  await put('nutritionTargets', { effectiveDate: today, kcal, protein: t.protein, fat: t.fat, carbs: carbsFor(kcal, t.protein, t.fat), reason: 'Undo auto change' });
   await setSetting('autoProtein', false);
   await setSetting('autoKcal', false);
   await remove('settings', 'autoUndo');
@@ -913,7 +936,7 @@ async function undoAuto(today = dateStr()) {
 
 async function dismissAuto() { await remove('settings', 'autoUndo'); }
 
-return { SETTINGS, steadyWeight, rebaseline, maybeAutoAdjust, undoAuto, dismissAuto };
+return { SETTINGS, steadyWeight, latestWeight, rebaseline, maybeAutoAdjust, undoAuto, dismissAuto };
 })();
 
 /* ===== js/goals.js ===== */
@@ -1374,8 +1397,18 @@ const { getAll, put, remove, dateStr, weekStart, parseDate } = __m['js/db.js'];
 const { dailyWeights, avgWindow, movingAvg, waistEntries } = __m['js/stats.js'];
 const { chartSvg, COLORS, autoFmt } = __m['js/charts.js'];
 const { esc, fmtDate, fmtLong, openSheet, addDays, dayNum, nowTime, r1 } = __m['js/ui.js'];
+const { maybeAutoAdjust } = __m['js/autotargets.js'];
+const { getSetting } = __m['js/db.js'];
+const { targetFor } = __m['js/stats.js'];
 
 let range = 90; // days shown, 0 means all
+
+// "Protein today 161 g" under the weigh in, when protein follows your weight.
+async function proteinNote(today = dateStr()) {
+  if (!(await getSetting('autoProtein', true))) return '';
+  const t = await targetFor(today);
+  return `Protein today ${t.protein} g`;
+}
 
 // The summary line shown once today's weight is saved.
 function summaryLine(daily, today = dateStr()) {
@@ -1388,10 +1421,10 @@ function summaryLine(daily, today = dateStr()) {
 }
 
 // Weigh in card. Prefilled with the most recent weight, so usually you only edit the decimals.
-function weighInHtml(daily, today = dateStr()) {
+function weighInHtml(daily, today = dateStr(), note = '') {
   const todayHas = daily.some((d) => d.date === today);
   if (todayHas) {
-    return `<div class="card"><h3>Morning weigh in</h3><div class="name">${esc(summaryLine(daily, today))}</div></div>`;
+    return `<div class="card"><h3>Morning weigh in</h3><div class="name">${esc(summaryLine(daily, today))}</div>${note ? `<div class="small muted" style="margin-top:4px">${esc(note)}</div>` : ''}</div>`;
   }
   const prev = daily.length ? daily[daily.length - 1].lb : '';
   return `
@@ -1411,6 +1444,7 @@ async function saveWeighIn(el, again) {
   const lb = parseFloat(String(input.value).replace(',', '.'));
   if (!(lb > 50 && lb < 600)) { input.classList.add('shake'); input.focus(); return; }
   await put('weights', { date: dateStr(), time: nowTime(), lb: r1(lb) });
+  await maybeAutoAdjust(); // protein follows this weigh in right away
   again();
 }
 
@@ -1456,9 +1490,10 @@ function waistChart(entries, height = 150) {
 }
 
 async function render(el) {
+  const today = dateStr();
+  await maybeAutoAdjust(today); // also catches an edited or deleted weigh in
   const daily = await dailyWeights();
   const waist = await waistEntries();
-  const today = dateStr();
   const entries = (await getAll('weights')).sort((a, b) => (b.date + (b.time || '')).localeCompare(a.date + (a.time || '')));
   const sunday = parseDate(today).getDay() === 0;
   const waistThisWeek = waist.some((w) => weekStart(parseDate(w.date)) === weekStart(parseDate(today)));
@@ -1466,7 +1501,7 @@ async function render(el) {
   el.innerHTML = `
     <div class="header"><h1>Weight</h1></div>
     <p class="sub">Weigh in first thing in the morning</p>
-    ${weighInHtml(daily, today)}
+    ${weighInHtml(daily, today, await proteinNote(today))}
 
     <div class="card">
       <h3>Trend</h3>
@@ -1552,7 +1587,7 @@ function editEntry(row, store, field, done) {
   });
 }
 
-return { summaryLine, weighInHtml, saveWeighIn, weightChart, waistChart, render };
+return { summaryLine, weighInHtml, proteinNote, saveWeighIn, weightChart, waistChart, render };
 })();
 
 /* ===== js/checkin.js ===== */
@@ -1869,7 +1904,7 @@ const { maybeAutoAdjust, undoAuto, dismissAuto } = __m['js/autotargets.js'];
 const { friendSetupSheet } = __m['js/screens/setup.js'];
 const { ensureWeekTargets, weekTargets, isBaselineWeek, loadPlan } = __m['js/targets.js'];
 const { dailyWeights, waistEntries, targetFor } = __m['js/stats.js'];
-const { weighInHtml, saveWeighIn } = __m['js/screens/weight.js'];
+const { weighInHtml, proteinNote, saveWeighIn } = __m['js/screens/weight.js'];
 const { checkInStatus, computeCheckIn, applyDelta, saveCheckIn } = __m['js/checkin.js'];
 const { backupDue, exportJsonFile } = __m['js/backup.js'];
 const { savePhoto } = __m['js/photos.js'];
@@ -1949,7 +1984,7 @@ async function render(el) {
 
   // Weigh in
   const daily = await dailyWeights();
-  const weigh = weighInHtml(daily, today);
+  const weigh = weighInHtml(daily, today, await proteinNote(today));
 
   // Food summary
   const entries = await getAllByIndex('foodEntries', 'date', today);
@@ -3073,6 +3108,7 @@ const { getAll, getAllByIndex, put, remove, getSetting, setSetting, dateStr, day
 const { targetFor } = __m['js/stats.js'];
 const { esc, fmtLong, openSheet, addDays, nowTime } = __m['js/ui.js'];
 const { getDays } = __m['js/seed.js'];
+const { maybeAutoAdjust, latestWeight } = __m['js/autotargets.js'];
 
 let viewDate = null; // lets you log for another day when you forgot
 let viewBase = null; // the real "today" when viewDate was set, so a new day resets the view
@@ -3104,6 +3140,9 @@ async function render(el) {
   const today = dateStr();
   if (!viewDate || viewBase !== today) { viewDate = today; viewBase = today; }
   const date = viewDate;
+  await maybeAutoAdjust(today);
+  const autoProtein = await getSetting('autoProtein', true);
+  const lw = autoProtein ? await latestWeight(date) : null;
   const entries = (await getAllByIndex('foodEntries', 'date', date)).sort((a, b) => (a.time || '').localeCompare(b.time || '') || a.id - b.id);
   const presets = (await getAll('foodPresets')).sort((a, b) => a.sortOrder - b.sortOrder);
   const target = await targetFor(date);
@@ -3129,6 +3168,7 @@ async function render(el) {
       ${ring(tot.kcal, target.kcal, 'Calories', 'kcal')}
       ${ring(tot.protein, target.protein, 'Protein', 'g')}
     </div>
+    ${lw ? `<div class="small muted" style="margin:-4px 4px 4px">Protein ${target.protein} g follows your weigh in of ${lw.lb.toFixed(1)} lb${lw.date !== date ? ` (${lw.date === addDays(date, -1) ? 'yesterday' : 'last one logged'})` : ''}</div>` : ''}
     <div class="small muted" style="margin:-4px 4px 12px">Soft guides: carbs ${n0(tot.carbs)} of ${n0(target.carbs)} g, fat ${n0(tot.fat)} of ${n0(target.fat)} g</div>
 
     ${liftDay ? `<label class="card check-line" style="margin-bottom:12px"><input type="checkbox" data-act="carb" ${carbDone ? 'checked' : ''}> Carb portion before or after lifting</label>` : ''}
@@ -3610,7 +3650,7 @@ const { rebaseline } = __m['js/autotargets.js'];
 const { GOALS, ACTIVITY, suggestTargets } = __m['js/goals.js'];
 const { dailyWeights } = __m['js/stats.js'];
 const { friendSetupSheet } = __m['js/screens/setup.js'];
-const { steadyWeight } = __m['js/autotargets.js'];
+const { steadyWeight, latestWeight } = __m['js/autotargets.js'];
 const { esc, fmtW, openSheet } = __m['js/ui.js'];
 const { openMiniPicker, miniSlots } = __m['js/skip.js'];
 const { openAddExercise, openEditSlot } = __m['js/plan.js'];
@@ -3645,7 +3685,7 @@ async function render(el) {
   const autoProtein = await getSetting('autoProtein', true);
   const autoKcal = await getSetting('autoKcal', false);
   const goal = await getSetting('goal', 'bulk');
-  const sw = await steadyWeight();
+  const lw = await latestWeight();
   const ppl = await getSetting('proteinPerLb', null);
 
   let planHtml = '';
@@ -3737,8 +3777,8 @@ async function render(el) {
       <label class="check-line"><input type="checkbox" data-act="autoprotein" ${autoProtein ? 'checked' : ''}> Protein follows my body weight</label>
       <label class="check-line"><input type="checkbox" data-act="autokcal" ${autoKcal ? 'checked' : ''}> Calories follow my body weight</label>
       <div class="small muted" style="margin-top:8px;line-height:1.45">
-        ${ppl && sw ? `Your ratio is ${ppl.toFixed(2)} g of protein per lb at about ${sw.toFixed(1)} lb. ` : 'Needs 3 weigh ins in a week to start. '}
-        Protein moves in steps of 5 g, at most once a week, and you get a notice with an Undo. Calories are off by default because your check in already changes them from your weight and waist trend, and the two would fight each other.
+        ${ppl && lw ? `Your ratio is ${ppl.toFixed(2)} g of protein per lb, so ${lw.lb.toFixed(1)} lb means ${Math.round(ppl * lw.lb)} g. ` : 'Starts with your first weigh in. '}
+        Protein updates every morning from that day's weigh in and shows on Today, Food and Progress. Changing your protein target by hand sets a new ratio. Calories are off by default because your check in already changes them from your weight and waist trend, and the two would fight each other. When on, calories use your 7 day average, at most once a week, with a notice and an Undo.
       </div>
     </div>
 
