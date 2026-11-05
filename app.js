@@ -3632,6 +3632,7 @@ function weightLine(s, ex) {
 }
 
 const num = (v) => { const x = parseFloat(String(v).replace(',', '.')); return Number.isNaN(x) ? null : x; };
+const n0 = (v) => Math.round(v || 0);
 
 async function render(el) {
   const exercises = new Map((await getAll('exercises')).map((e) => [e.id, e]));
@@ -3813,8 +3814,37 @@ function editTargets(t, done) {
       <label class="field">Carbs g, soft<input id="t-carb" inputmode="numeric" value="${t.carbs}"></label>
       <label class="field">Fat g, soft<input id="t-fat" inputmode="numeric" value="${t.fat}"></label>
     </div>
+    <div class="small muted" id="t-sum" style="margin:-4px 4px 12px"></div>
     <button class="btn" data-act="save">Save</button>
     <button class="btn secondary" data-act="cancel">Cancel</button>`);
+  // Auto fill: changing calories sets fat to 27% of calories (same split as the goal recalculation)
+  // and carbs take what is left after protein and fat. Changing protein or fat refits carbs.
+  // Typing carbs yourself leaves everything else alone; the line below shows what it adds up to.
+  const box = (id) => root.querySelector(id);
+  const val = (id) => num(box(id).value);
+  const refitCarbs = () => {
+    const kcal = val('#t-kcal'), pro = val('#t-pro') || 0, fat = val('#t-fat') || 0;
+    if (kcal > 0) box('#t-carb').value = Math.max(0, Math.round((kcal - pro * 4 - fat * 9) / 4));
+  };
+  const showSum = () => {
+    const pro = val('#t-pro') || 0, carb = val('#t-carb') || 0, fat = val('#t-fat') || 0, kcal = val('#t-kcal') || 0;
+    const total = Math.round(pro * 4 + carb * 4 + fat * 9);
+    const off = total - kcal;
+    box('#t-sum').innerHTML = `Protein ${n0(pro * 4)} + carbs ${n0(carb * 4)} + fat ${n0(fat * 9)} = ${n0(total)} kcal`
+      + (kcal > 0 && Math.abs(off) > 20 ? ` <span style="color:var(--warn)">(${off > 0 ? n0(off) + ' over' : n0(-off) + ' under'})</span>` : '');
+  };
+  root.addEventListener('input', (e) => {
+    const id = e.target.id;
+    if (id === 't-kcal') {
+      const kcal = val('#t-kcal');
+      if (kcal > 0) box('#t-fat').value = Math.round((kcal * 0.27) / 9);
+      refitCarbs();
+    } else if (id === 't-pro' || id === 't-fat') {
+      refitCarbs();
+    }
+    showSum();
+  });
+  showSum();
   root.addEventListener('click', async (e) => {
     const act = e.target.closest('[data-act]')?.dataset.act;
     if (act === 'cancel') return close();
