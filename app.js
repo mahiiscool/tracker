@@ -379,12 +379,13 @@ function stalled(lastSets, prevSets, W, repMin) {
   return bad(lastSets) && bad(prevSets);
 }
 
+// Hand out extra reps starting from the first set, since fatigue makes later sets drop.
 function spreadExtras(base, extra) {
   const out = [...base];
-  let i = out.length - 1;
+  let i = 0;
   for (let k = 0; k < extra; k++) {
     out[i] += 1;
-    i = i - 1 < 0 ? out.length - 1 : i - 1;
+    i = i + 1 >= out.length ? 0 : i + 1;
   }
   return out;
 }
@@ -414,7 +415,7 @@ function nextTarget({ slot, ex, lastSets, prevSets = [], rule = 'first' }) {
   const lastKnown = atW[atW.length - 1].reps;
   const base = Array.from({ length: n }, (_, i) => (atW[i] ? atW[i].reps : lastKnown));
 
-  // Bodyweight to failure: last total plus 2, filled from the last set backwards.
+  // Bodyweight to failure: last total plus 2, filled from the first set forwards.
   if (slot.amrap) {
     const reps = spreadExtras(base, 2);
     const suggestion = hit
