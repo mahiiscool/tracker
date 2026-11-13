@@ -2307,7 +2307,7 @@ const { getAll, getAllByIndex, put, remove, getSetting, setSetting, dateStr, day
 const { getDays, DAY_NAMES } = __m['js/seed.js'];
 const { loadPlan, loadHistory, weekTargets, ensureWeekTargets, isBaselineWeek, saveTarget, getRule, targetText, syncWeightToSiblings } = __m['js/targets.js'];
 const { workingWeight, stepWeight, nextTarget, findBests } = __m['js/progression.js'];
-const { esc, fmtW, fmtDate, openSheet, CHECK } = __m['js/ui.js'];
+const { esc, fmtW, fmtDate, openSheet, CHECK, addDays } = __m['js/ui.js'];
 const { openAddExercise, removeSlot } = __m['js/plan.js'];
 const { openSkipSheet, undoSkip, miniSlots } = __m['js/skip.js'];
 
@@ -2388,8 +2388,9 @@ async function otherDayState(dayList) {
   return { state, sessions };
 }
 function s2text(s, key) {
-  if (s.comboDays && s.day !== key) return `Already done with ${DAY_NAMES[s.day]}`;
-  return s.finishedAt ? `Already done ${fmtDate(s.date)}` : 'Already started';
+  const tip = '. Use Reset this day on the Workout tab to free it.';
+  if (s.comboDays && s.day !== key) return `Already done with ${DAY_NAMES[s.day]}${tip}`;
+  return (s.finishedAt ? `Already done ${fmtDate(s.date)}` : 'Already started') + tip;
 }
 
 async function openCombineSheet() {
@@ -2551,6 +2552,7 @@ async function renderList(el, dayList) {
         <div class="muted small">${esc(info.subtitle || '')}${st.text ? ', ' + st.text : ''}</div>
         <a class="btn ${d === today ? '' : 'secondary'}" href="#/workout/${sess ? sess.day : d}" style="text-decoration:none;text-align:center;line-height:52px">${st.label}</a>
         ${!sess ? `<a class="link" href="#/workout/${d}?combine" style="display:block;text-align:center;line-height:44px;text-decoration:none">Combine with another day</a>` : ''}
+        ${opened.some((s) => daysOf(s).includes(d)) ? `<button class="link" data-act="resetday" data-day="${d}" style="display:block;margin:0 auto">Reset this day</button>` : ''}
         <details class="targets">
           <summary>Targets (${daySlots.length} exercises)</summary>
           ${rows}
@@ -2566,6 +2568,8 @@ async function renderList(el, dayList) {
   `;
 
   el.onclick = async (e) => {
+    const rb = e.target.closest('[data-act="resetday"]');
+    if (rb) return openResetDay(rb.dataset.day, opened.filter((s) => daysOf(s).includes(rb.dataset.day)), ws, () => renderList(el, dayList));
     const btn = e.target.closest('[data-act="target"]');
     if (!btn) return;
     const slot = slots.find((s) => s.id === btn.dataset.slot);
@@ -2573,6 +2577,62 @@ async function renderList(el, dayList) {
     const sibs = slots.some((x) => x.exerciseId === slot.exerciseId && x.id !== slot.id);
     openOverride(slot, ex, targets.get(slot.id), ws, () => renderList(el, dayList), sibs);
   };
+}
+
+// Reset one day for this week only. Other weeks are never touched.
+// "Move to last week" keeps the sets (for lifts typed in late) and frees this week's day.
+function openResetDay(day, list, ws, done) {
+  const combo = list.find((s) => s.comboDays && s.comboDays.length > 1);
+  const comboTxt = combo ? `<p class="muted small">This is a combined workout (${combo.comboDays.map((k) => DAY_NAMES[k]).join(' and ')}). Resetting it frees all of those days.</p>` : '';
+  const { root, close } = openSheet(`
+    <h2>Reset ${DAY_NAMES[day]}</h2>
+    <p class="muted">Only the week of ${fmtDate(ws)} changes. Earlier weeks stay as they are.</p>
+    ${comboTxt}
+    <button class="btn" data-act="move">Move it to last week</button>
+    <div class="muted small" style="margin:6px 0 10px">For sets from last week that you logged late. They count as last week's lifts, this week's targets are rebuilt from them, and ${DAY_NAMES[day]} is open again.</div>
+    <button class="btn secondary" data-act="erase" style="color:#FBBF24">Erase this week's ${DAY_NAMES[day]}</button>
+    <div class="muted small" style="margin:6px 0 10px">Deletes the sets and any skip logged for it this week.</div>
+    <button class="btn secondary" data-act="cancel">Cancel</button>`);
+  root.addEventListener('click', async (e) => {
+    const act = e.target.closest('[data-act]')?.dataset.act;
+    if (act === 'cancel') return close();
+    if (act === 'erase') {
+      if (!confirm(`Erase ${DAY_NAMES[day]} for this week? This cannot be undone.`)) return;
+      for (const s of list) {
+        for (const r of await getAllByIndex('sets', 'sessionId', s.id)) await remove('sets', r.id);
+        await remove('sessions', s.id);
+      }
+    } else if (act === 'move') {
+      const prevWs = addDays(ws, -7);
+      const touched = new Set();
+      for (const s of list) {
+        const rows = await getAllByIndex('sets', 'sessionId', s.id);
+        const logged = rows.filter((r) => r.completed);
+        if (!logged.length) {
+          // Nothing lifted (an empty or skip only entry): just clear it.
+          for (const r of rows) await remove('sets', r.id);
+          await remove('sessions', s.id);
+          continue;
+        }
+        for (const r of rows.filter((x) => !x.completed)) await remove('sets', r.id);
+        for (const r of logged) touched.add(r.exerciseId);
+        const date = addDays(s.date || ws, -7);
+        await put('sessions', { ...s, date, weekStart: weekStart(parseDate(date)), finishedAt: s.finishedAt || Date.now(), skipped: false });
+      }
+      if (touched.size) {
+        // Lifts now sit in last week, so last week is the baseline at the latest.
+        const bw = await getSetting('baselineWeek', null);
+        if (!bw || bw > prevWs) await setSetting('baselineWeek', prevWs);
+        // Rebuild this week's targets for those exercises, keeping anything you edited by hand.
+        for (const r of await getAllByIndex('weeklyTargets', 'weekStart', ws)) {
+          if (touched.has(r.exerciseId) && !r.overridden) await remove('weeklyTargets', r.id);
+        }
+        await ensureWeekTargets(ws);
+      }
+    } else return;
+    close();
+    done();
+  });
 }
 
 function openOverride(slot, ex, row, ws, done, hasSiblings = false) {
