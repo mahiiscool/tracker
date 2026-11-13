@@ -1949,7 +1949,7 @@ async function render(el) {
   if (info) {
     const n = allSlots.filter((s) => s.day === key).length;
     const sessions = (await getAll('sessions')).filter((s) =>
-      !s.imported && s.day === key && (s.date === today || (!s.finishedAt && s.weekStart === ws)));
+      !s.imported && (s.day === key || (s.comboDays || []).includes(key)) && (s.date === today || (!s.finishedAt && s.weekStart === ws)));
     let sess = sessions.sort((a, b) => a.id - b.id).pop();
     // A workout that was only opened, with nothing logged, has not really started.
     if (sess && !sess.skipped && !sess.finishedAt) {
@@ -1959,15 +1959,17 @@ async function render(el) {
     const skippedOnly = sess && sess.skipped && !sess.mini;
     const label = !n ? 'Add exercises' : !sess ? 'Start workout' : skippedOnly ? 'View skipped day' : sess.finishedAt ? 'View summary' : 'Resume';
     const skipNote = skippedOnly ? `Skipped today: ${esc(sess.skipReason || 'no reason')}. ` : '';
-    const href = n ? `#/workout/${key}` : '#/settings';
+    const href = n ? `#/workout/${sess ? sess.day : key}` : '#/settings';
+    const comboNote = sess && sess.comboDays ? `Combined with ${sess.comboDays.filter((k) => k !== key).map((k) => DAY_NAMES[k]).join(' and ')}. ` : '';
     workout = `
       <div class="card">
         <h3>Today's workout</h3>
         <h2>${esc(info.title)}</h2>
         <div class="muted">${esc(info.subtitle || '')}</div>
-        <div class="small muted" style="margin-top:8px">${skipNote}${n} exercises. ${weekLine}.</div>
+        <div class="small muted" style="margin-top:8px">${skipNote}${comboNote}${n} exercises. ${weekLine}.</div>
         <a class="btn" href="${href}" style="text-decoration:none;text-align:center;line-height:52px">${label}</a>
-        ${n && !sess ? `<button class="link" data-act="skipday" data-day="${key}" style="display:block;margin:12px auto 0">Skip this day</button>` : ''}
+        ${n && !sess ? `<a class="link" href="#/workout/${key}?combine" style="display:block;text-align:center;line-height:44px;margin-top:8px;text-decoration:none">Combine with a missed day</a>` : ''}
+        ${n && !sess ? `<button class="link" data-act="skipday" data-day="${key}" style="display:block;margin:0 auto">Skip this day</button>` : ''}
       </div>`;
   } else {
     const next = nextTrainingDay(now, days.map((d) => d.key));
@@ -2316,8 +2318,150 @@ async function render(el, arg) {
   stopRest();
   S = null;
   const days = await getDays();
-  if (arg && days.some((d) => d.key === arg)) return renderSession(el, arg, days);
+  if (arg && days.some((d) => d.key === arg)) {
+    // #/workout/fri?combine opens the session and then the combine sheet.
+    const wantsCombine = location.hash.includes('?combine');
+    if (wantsCombine) history.replaceState(null, '', `#/workout/${arg}`);
+    await renderSession(el, arg, days);
+    if (wantsCombine && S && !S.session.mini) openCombineSheet();
+    return;
+  }
   return renderList(el, days);
+}
+
+/* ------------------------------------------------------------------ */
+/* Combined days (make up a missed day by doing two or more together)  */
+/* ------------------------------------------------------------------ */
+
+// Every training day a session counts for.
+function daysOf(session) {
+  return session.comboDays && session.comboDays.length ? session.comboDays : [session.day];
+}
+
+// The plan slots a session shows.
+function slotsFor(session, all) {
+  if (session.mini) return session.miniSlotIds.map((id) => all.find((x) => x.id === id)).filter(Boolean);
+  if (session.comboDays && session.comboSlotIds) return session.comboSlotIds.map((id) => all.find((x) => x.id === id)).filter(Boolean);
+  return all.filter((s) => s.day === session.day);
+}
+
+function comboTitle(session, dayList) {
+  return daysOf(session).map((k) => (dayList.find((d) => d.key === k) || { title: DAY_NAMES[k] }).title).join(' + ');
+}
+
+// Slots for a set of days. Primary day first, then the others in week order.
+// An exercise on more than one day shows once: the slot with logged sets wins, then the one with more sets.
+function buildComboSlots(days, all, locked) {
+  const order = [];
+  for (const d of days) for (const s of all.filter((x) => x.day === d).sort((a, b) => a.order - b.order)) order.push(s);
+  const pick = new Map();
+  for (const s of order) {
+    const cur = pick.get(s.exerciseId);
+    if (!cur) { pick.set(s.exerciseId, s); continue; }
+    if (locked.has(cur.id)) continue;
+    if (locked.has(s.id) || s.sets > cur.sets) pick.set(s.exerciseId, s);
+  }
+  const seen = new Set();
+  const out = [];
+  for (const s of order) {
+    if (seen.has(s.exerciseId)) continue;
+    seen.add(s.exerciseId);
+    out.push(pick.get(s.exerciseId));
+  }
+  return out;
+}
+
+// Status of the other days this week, so finished days can't be combined twice.
+async function otherDayState(dayList) {
+  const ws = S.ws;
+  const sessions = (await getAll('sessions')).filter((s) => !s.imported && s.id !== S.session.id && s.weekStart === ws);
+  const logged = new Set((await getAll('sets')).filter((r) => r.completed).map((r) => r.sessionId));
+  const state = new Map();
+  for (const info of dayList) {
+    if (info.key === S.session.day) continue;
+    const mine = sessions.filter((s) => daysOf(s).includes(info.key));
+    const real = mine.find((s) => logged.has(s.id) || (s.finishedAt && !s.skipped) || s.mini);
+    if (real) state.set(info.key, { blocked: true, text: s2text(real, info.key) });
+    else if (mine.some((s) => s.skipped)) state.set(info.key, { blocked: false, text: 'Skipped, this replaces the skip' });
+    else state.set(info.key, { blocked: false, text: '' });
+  }
+  return { state, sessions };
+}
+function s2text(s, key) {
+  if (s.comboDays && s.day !== key) return `Already done with ${DAY_NAMES[s.day]}`;
+  return s.finishedAt ? `Already done ${fmtDate(s.date)}` : 'Already started';
+}
+
+async function openCombineSheet() {
+  const dayList = await getDays();
+  const { state, sessions } = await otherDayState(dayList);
+  const current = new Set(daysOf(S.session).filter((k) => k !== S.session.day));
+  const options = dayList.filter((d) => d.key !== S.session.day);
+  if (!options.length) return alert('You only have one training day set up.');
+  const { root, close } = openSheet(`
+    <h2>Combine days</h2>
+    <p class="muted">Do another day's exercises in this workout, for example a day you missed. When you finish, every day you pick here is marked done and its targets move up like normal.</p>
+    ${options.map((d) => {
+      const st = state.get(d.key) || {};
+      const on = current.has(d.key);
+      const dis = st.blocked && !on;
+      return `<label class="check-line" style="${dis ? 'opacity:.5' : ''}">
+        <input type="checkbox" data-day="${d.key}" ${on ? 'checked' : ''} ${dis ? 'disabled' : ''}>
+        <span>${DAY_NAMES[d.key]}, ${esc(d.title)}${st.text && !on ? `<br><span class="muted small">${esc(st.text)}</span>` : ''}</span></label>`;
+    }).join('')}
+    <p class="muted small">Exercises that are on more than one day show once, with the larger number of sets.</p>
+    <button class="btn" data-act="save">Save</button>
+    <button class="btn secondary" data-act="cancel">Cancel</button>`);
+  root.addEventListener('click', async (e) => {
+    const act = e.target.closest('[data-act]')?.dataset.act;
+    if (act === 'cancel') return close();
+    if (act !== 'save') return;
+    const picked = [...root.querySelectorAll('input[data-day]')].filter((i) => i.checked).map((i) => i.dataset.day);
+    const ok = await applyCombo(picked, dayList, sessions);
+    if (!ok) return;
+    close();
+    draw();
+  });
+}
+
+// Rebuild this session's exercise list for the picked extra days.
+async function applyCombo(extra, dayList, otherSessions) {
+  const { exercises, slots: all } = await loadPlan();
+  const keyOrder = new Map(dayList.map((d, i) => [d.key, i]));
+  const days = [S.session.day, ...extra.sort((a, b) => keyOrder.get(a) - keyOrder.get(b))];
+  const locked = new Set(S.sets.filter((r) => r.completed).map((r) => r.slotId));
+  const next = buildComboSlots(days, all, locked);
+  const keep = new Set(next.map((s) => s.id));
+  const lost = [...locked].filter((id) => !keep.has(id)).map((id) => all.find((x) => x.id === id)).filter(Boolean);
+  if (lost.length) {
+    alert(`You already logged ${lost.map((s) => s.label).join(', ')} from ${[...new Set(lost.map((s) => DAY_NAMES[s.day]))].join(' and ')}. Uncheck those sets first.`);
+    return false;
+  }
+  // Empty or skip only sessions for the added days this week are replaced by this one.
+  for (const s of otherSessions) {
+    if (!extra.some((k) => daysOf(s).includes(k))) continue;
+    const rows = await getAllByIndex('sets', 'sessionId', s.id);
+    if (rows.some((r) => r.completed) || s.mini || (s.finishedAt && !s.skipped)) continue;
+    for (const r of rows) await remove('sets', r.id);
+    await remove('sessions', s.id);
+  }
+  // Drop unlogged set rows for exercises that are no longer in this workout.
+  for (const r of S.sets.filter((x) => !keep.has(x.slotId))) await remove('sets', r.id);
+  S.sets = S.sets.filter((x) => keep.has(x.slotId));
+  if (extra.length) {
+    S.session.comboDays = days;
+    S.session.comboSlotIds = next.map((s) => s.id);
+  } else {
+    delete S.session.comboDays;
+    delete S.session.comboSlotIds;
+  }
+  await put('sessions', S.session);
+  S.exercises = exercises;
+  S.slots = slotsFor(S.session, all);
+  S.dayInfo = { ...(dayList.find((d) => d.key === S.session.day) || { title: 'Workout', subtitle: '' }) };
+  if (extra.length) S.dayInfo = { title: comboTitle(S.session, dayList), subtitle: `Combined: ${days.map((k) => DAY_NAMES[k]).join(' and ')}` };
+  await ensureSetRows();
+  return true;
 }
 
 /* ------------------------------------------------------------------ */
@@ -2341,11 +2485,13 @@ function latest(arr) {
   return arr.slice().sort((a, b) => a.id - b.id)[arr.length - 1];
 }
 
-function statusOf(session) {
+function statusOf(session, forDay = null) {
   if (!session) return { text: '', label: 'Start workout' };
   if (session.skipped && !session.mini) return { text: `Skipped, ${session.skipReason || 'no reason'}`, label: 'View' };
-  if (session.finishedAt) return { text: `${session.mini ? 'Mini workout done' : 'Done'} ${fmtDate(session.date)}`, label: 'View summary' };
-  return { text: session.mini ? 'Mini workout in progress' : 'In progress', label: 'Resume' };
+  const others = session.comboDays ? session.comboDays.filter((k) => k !== forDay).map((k) => DAY_NAMES[k]).join(' and ') : '';
+  const withTxt = others ? `, combined with ${others}` : '';
+  if (session.finishedAt) return { text: `${session.mini ? 'Mini workout done' : 'Done'} ${fmtDate(session.date)}${withTxt}`, label: 'View summary' };
+  return { text: (session.mini ? 'Mini workout in progress' : 'In progress') + withTxt, label: 'Resume' };
 }
 
 /* ------------------------------------------------------------------ */
@@ -2378,8 +2524,8 @@ async function renderList(el, dayList) {
   const dayCards = dayList.map((info) => {
     const d = info.key;
     const daySlots = slots.filter((s) => s.day === d);
-    const sess = latest(sessions.filter((s) => s.day === d));
-    const st = statusOf(sess);
+    const sess = latest(sessions.filter((s) => daysOf(s).includes(d)));
+    const st = statusOf(sess, d);
     const rows = daySlots.map((s) => {
       const ex = exercises.get(s.exerciseId);
       const t = targets.get(s.id);
@@ -2403,7 +2549,8 @@ async function renderList(el, dayList) {
         <h3>${DAY_NAMES[d]}${d === today ? ', today' : ''}</h3>
         <h2>${esc(info.title)}</h2>
         <div class="muted small">${esc(info.subtitle || '')}${st.text ? ', ' + st.text : ''}</div>
-        <a class="btn ${d === today ? '' : 'secondary'}" href="#/workout/${d}" style="text-decoration:none;text-align:center;line-height:52px">${st.label}</a>
+        <a class="btn ${d === today ? '' : 'secondary'}" href="#/workout/${sess ? sess.day : d}" style="text-decoration:none;text-align:center;line-height:52px">${st.label}</a>
+        ${!sess ? `<a class="link" href="#/workout/${d}?combine" style="display:block;text-align:center;line-height:44px;text-decoration:none">Combine with another day</a>` : ''}
         <details class="targets">
           <summary>Targets (${daySlots.length} exercises)</summary>
           ${rows}
@@ -2475,14 +2622,14 @@ async function renderSession(el, day, dayList) {
   const { exercises, slots: all } = await loadPlan();
 
   // Today's session, an unfinished one from this week, or a finished one from earlier this week.
+  // A combined session counts for every day in it, so Wednesday's card finds Friday's combined workout.
   const mine = (await getAll('sessions')).filter((s) =>
-    !s.imported && s.day === day && (s.date === today || s.weekStart === ws));
+    !s.imported && daysOf(s).includes(day) && (s.date === today || s.weekStart === ws));
   let session = latest(mine);
   if (session && session.skipped && !session.mini && session.finishedAt) return renderSkipped(el, session, dayList);
   if (session && session.finishedAt) return renderSummary(el, session);
-  const slots = session && session.mini
-    ? session.miniSlotIds.map((id) => all.find((x) => x.id === id)).filter(Boolean)
-    : all.filter((s) => s.day === day);
+  if (session) day = session.day;
+  const slots = session ? slotsFor(session, all) : all.filter((s) => s.day === day);
   if (!session) {
     session = { date: today, day, weekStart: ws, startedAt: Date.now(), finishedAt: null, notes: '', exerciseNotes: {} };
     session.id = await put('sessions', session);
@@ -2500,7 +2647,9 @@ async function renderSession(el, day, dayList) {
 
   S = {
     el, session, day, ws, exercises, slots,
-    dayInfo: dayList.find((d) => d.key === day) || { title: 'Workout', subtitle: '' },
+    dayInfo: session.comboDays
+      ? { title: comboTitle(session, dayList), subtitle: `Combined: ${session.comboDays.map((k) => DAY_NAMES[k]).join(' and ')}` }
+      : (dayList.find((d) => d.key === day) || { title: 'Workout', subtitle: '' }),
     targets: await weekTargets(ws),
     baseline: await isBaselineWeek(ws),
     hist: await loadHistory(session.id),
@@ -2566,7 +2715,8 @@ function draw() {
     ${slots.length ? '' : '<div class="card"><h2>No exercises yet</h2><div class="muted">Add your first exercise below.</div></div>'}
     <div id="cards">${slots.map(cardHtml).join('')}</div>
     ${S.session.mini ? '' : '<button class="btn secondary" data-act="addex">Add exercise</button>'}
-    ${!S.session.mini && !S.sets.some((r) => r.completed) ? '<button class="link" data-act="skipday" style="display:block;margin:14px auto">Skip this day</button>' : ''}
+    ${S.session.mini ? '' : `<button class="link" data-act="combine" style="display:block;margin:14px auto 0">${S.session.comboDays ? 'Change combined days' : 'Combine with another day'}</button>`}
+    ${!S.session.mini && !S.session.comboDays && !S.sets.some((r) => r.completed) ? '<button class="link" data-act="skipday" style="display:block;margin:14px auto">Skip this day</button>' : ''}
     <div id="sessionbar">
       <div id="restbar" hidden>
         <span id="resttxt"></span>
@@ -2875,6 +3025,7 @@ async function onClick(e) {
     S.sets = S.sets.filter((r) => r.id !== last.id);
     return refreshCard(btn.dataset.slot);
   }
+  if (act === 'combine') return openCombineSheet();
   if (act === 'skipday') {
     const { el, day, dayInfo } = S;
     return openSkipSheet(day, dayInfo.title, async () => { stopRest(); S = null; renderSession(el, day, await getDays()); });
@@ -2894,7 +3045,13 @@ async function onClick(e) {
     return openAddExercise(S.day, async () => {
       const plan = await loadPlan();
       S.exercises = plan.exercises;
-      S.slots = plan.slots.filter((x) => x.day === S.day);
+      if (S.session.comboDays) {
+        // New exercise goes on the main day's plan and into this combined workout.
+        const have = new Set(S.session.comboSlotIds);
+        for (const x of plan.slots) if (x.day === S.day && !have.has(x.id)) S.session.comboSlotIds.push(x.id);
+        await put('sessions', S.session);
+      }
+      S.slots = slotsFor(S.session, plan.slots);
       await ensureWeekTargets(S.ws);
       S.targets = await weekTargets(S.ws);
       await ensureSetRows();
@@ -3005,9 +3162,7 @@ async function renderSkipped(el, session, dayList) {
 async function renderSummary(el, session) {
   stopRest();
   const { exercises, slots: all } = await loadPlan();
-  const slots = session.mini
-    ? session.miniSlotIds.map((id) => all.find((x) => x.id === id)).filter(Boolean)
-    : all.filter((s) => s.day === session.day);
+  const slots = slotsFor(session, all);
   const allSets = await getAllByIndex('sets', 'sessionId', session.id);
   const sets = allSets.filter((s) => s.completed && s.reps > 0);
   const lostSets = allSets.filter((s) => s.completed && s.reps == null);
@@ -3017,7 +3172,9 @@ async function renderSummary(el, session) {
   const hist = await loadHistory(session.id);
   const rule = await getRule();
   const days = await getDays();
-  const dayInfo = days.find((d) => d.key === session.day) || { title: 'Workout' };
+  const dayInfo = session.comboDays
+    ? { title: comboTitle(session, days) }
+    : (days.find((d) => d.key === session.day) || { title: 'Workout' });
 
   let totalReps = 0;
   let volume = 0;
