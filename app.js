@@ -392,6 +392,30 @@ function spreadExtras(base, extra) {
 
 const total = (arr) => (arr ? arr.reduce((a, b) => a + b, 0) : null);
 
+// Make reps go from most to least. Fatigue means set 2 should never be asked to beat set 1.
+// Sets that are in order are left alone. Sets that are out of order (8, 13, 10) are pooled
+// and their reps shared evenly, so the total stays the same: 8, 13, 10 becomes 11, 10, 10.
+function nonIncreasing(arr) {
+  const spread = (b) => {
+    const q = Math.floor(b.sum / b.n);
+    const extra = b.sum - q * b.n;
+    return Array.from({ length: b.n }, (_, i) => q + (i < extra ? 1 : 0));
+  };
+  const blocks = arr.map((r) => ({ sum: r, n: 1 }));
+  let i = 0;
+  while (i < blocks.length - 1) {
+    const a = spread(blocks[i]);
+    const b = spread(blocks[i + 1]);
+    if (a[a.length - 1] < b[0]) {
+      blocks.splice(i, 2, { sum: blocks[i].sum + blocks[i + 1].sum, n: blocks[i].n + blocks[i + 1].n });
+      i = Math.max(0, i - 1);
+    } else {
+      i += 1;
+    }
+  }
+  return blocks.flatMap(spread);
+}
+
 // Build the next target for a slot.
 // slot: { sets, repMin, repMax, amrap }   ex: { kind, increment, weightLadder }
 // lastSets: sets from the most recent session of this slot. prevSets: the session before that.
@@ -413,7 +437,8 @@ function nextTarget({ slot, ex, lastSets, prevSets = [], rule = 'first' }) {
 
   // Reps per slot position, padding missing sets with the last known set at this weight.
   const lastKnown = atW[atW.length - 1].reps;
-  const base = Array.from({ length: n }, (_, i) => (atW[i] ? atW[i].reps : lastKnown));
+  // Then put them in most to least order, so one odd session does not carry forward.
+  const base = nonIncreasing(Array.from({ length: n }, (_, i) => (atW[i] ? atW[i].reps : lastKnown)));
 
   // Bodyweight to failure: last total plus 2, filled from the first set forwards.
   if (slot.amrap) {
@@ -488,7 +513,7 @@ function findBests(today, prior, kind) {
 // Estimated one rep max (Epley). Used by the charts later.
 function epley(w, r) { return w * (1 + r / 30); }
 
-return { sortedLadder, stepWeight, workingWeight, topHit, stalled, nextTarget, firstTarget, findBests, epley };
+return { sortedLadder, stepWeight, workingWeight, topHit, stalled, nonIncreasing, nextTarget, firstTarget, findBests, epley };
 })();
 
 /* ===== js/ui.js ===== */
