@@ -575,7 +575,7 @@ return { esc, fmtW, fmtDate, addDays, openSheet, CHECK, dayNum, diffDays, mean, 
 /* ===== js/targets.js ===== */
 __m['js/targets.js'] = (function () {
 // Data access for workouts: history, weekly target snapshots and the baseline week.
-const { getAll, getAllByIndex, put, putMany, getSetting, weekStart, parseDate } = __m['js/db.js'];
+const { getAll, getAllByIndex, put, putMany, remove, getSetting, weekStart, parseDate } = __m['js/db.js'];
 const { nextTarget, firstTarget } = __m['js/progression.js'];
 const { addDays } = __m['js/ui.js'];
 
@@ -744,7 +744,19 @@ function targetText(row, slot, ex) {
   return w ? `${w}, ${reps}` : reps;
 }
 
-return { loadPlan, loadHistory, weekTargets, isBaselineWeek, getRule, ensureWeekTargets, siblingSlots, syncWeightToSiblings, saveTarget, targetText };
+// Rebuild this week's targets for some slots from the earlier weeks' sessions, using the current logic.
+// Hand edits on those slots are replaced. Sets logged this week never count, only earlier weeks do.
+async function refreshTargets(ws, slotIds) {
+  if (await isBaselineWeek(ws)) return false;
+  const ids = new Set(slotIds);
+  for (const r of await getAllByIndex('weeklyTargets', 'weekStart', ws)) {
+    if (ids.has(r.slotId)) await remove('weeklyTargets', r.id);
+  }
+  await ensureWeekTargets(ws);
+  return true;
+}
+
+return { loadPlan, loadHistory, weekTargets, isBaselineWeek, getRule, ensureWeekTargets, refreshTargets, siblingSlots, syncWeightToSiblings, saveTarget, targetText };
 })();
 
 /* ===== js/stats.js ===== */
@@ -2330,7 +2342,7 @@ __m['js/screens/workout.js'] = (function () {
 // Workout tab: week overview with targets, the live session screen, and the finish summary.
 const { getAll, getAllByIndex, put, remove, getSetting, setSetting, dateStr, dayKey, weekStart, parseDate } = __m['js/db.js'];
 const { getDays, DAY_NAMES } = __m['js/seed.js'];
-const { loadPlan, loadHistory, weekTargets, ensureWeekTargets, isBaselineWeek, saveTarget, getRule, targetText, syncWeightToSiblings } = __m['js/targets.js'];
+const { loadPlan, loadHistory, weekTargets, ensureWeekTargets, refreshTargets, isBaselineWeek, saveTarget, getRule, targetText, syncWeightToSiblings } = __m['js/targets.js'];
 const { workingWeight, stepWeight, nextTarget, findBests } = __m['js/progression.js'];
 const { esc, fmtW, fmtDate, openSheet, CHECK, addDays } = __m['js/ui.js'];
 const { openAddExercise, removeSlot } = __m['js/plan.js'];
@@ -2800,6 +2812,7 @@ function draw() {
     ${slots.length ? '' : '<div class="card"><h2>No exercises yet</h2><div class="muted">Add your first exercise below.</div></div>'}
     <div id="cards">${slots.map(cardHtml).join('')}</div>
     ${S.session.mini ? '' : '<button class="btn secondary" data-act="addex">Add exercise</button>'}
+    ${S.baseline ? '' : '<button class="link" data-act="refreshall" style="display:block;margin:14px auto 0">Refresh all targets</button>'}
     ${S.session.mini ? '' : `<button class="link" data-act="combine" style="display:block;margin:14px auto 0">${S.session.comboDays ? 'Change combined days' : 'Combine with another day'}</button>`}
     ${!S.session.mini && !S.session.comboDays && !S.sets.some((r) => r.completed) ? '<button class="link" data-act="skipday" style="display:block;margin:14px auto">Skip this day</button>' : ''}
     <div id="sessionbar">
@@ -2924,10 +2937,36 @@ function cardHtml(slot) {
         <button class="link" data-act="addset" data-slot="${slot.id}">+ set</button>
         ${rows.length > 1 && !rows[rows.length - 1].completed ? `<button class="link" data-act="rmset" data-slot="${slot.id}">Remove last set</button>` : ''}
         <button class="link" data-act="notes" data-ex="${ex.id}">${note ? 'Note' : 'Add note'}</button>
+        ${S.baseline ? '' : `<button class="link" data-act="refreshtgt" data-slot="${slot.id}">Refresh target</button>`}
         ${S.session.mini ? '' : `<button class="link" data-act="rmex" data-slot="${slot.id}">Remove exercise</button>`}
       </div>
       ${noteOpen ? `<textarea class="note" data-note="${ex.id}" rows="2" placeholder="Note for this exercise">${esc(note)}</textarea>` : ''}
     </section>`;
+}
+
+// Rebuild targets for these slots from earlier weeks, then update the cards on screen.
+// Empty set rows that were prefilled with the old target weight take the new target weight.
+async function refreshSessionTargets(slotIds) {
+  if (S.baseline) return alert('Baseline week, there are no targets to refresh yet.');
+  const edited = slotIds.filter((id) => { const t = S.targets.get(id); return t && t.overridden; });
+  if (edited.length && !confirm(edited.length === 1
+    ? 'You edited this target by hand. Replace it with a fresh one?'
+    : `You edited ${edited.length} targets by hand. Replace them with fresh ones?`)) return;
+  const oldW = new Map(slotIds.map((id) => { const t = S.targets.get(id); return [id, t ? t.targetWeight : null]; }));
+  await refreshTargets(S.ws, slotIds);
+  S.targets = await weekTargets(S.ws);
+  for (const id of slotIds) {
+    const t = S.targets.get(id);
+    if (t && t.targetWeight != null) {
+      for (const r of S.sets.filter((x) => x.slotId === id && !x.completed && x.reps == null)) {
+        if ((r.weight ?? 0) === (oldW.get(id) ?? 0) && r.weight !== t.targetWeight) {
+          r.weight = t.targetWeight;
+          await put('sets', r);
+        }
+      }
+    }
+    refreshCard(id);
+  }
 }
 
 function refreshCard(slotId) {
@@ -3110,6 +3149,8 @@ async function onClick(e) {
     S.sets = S.sets.filter((r) => r.id !== last.id);
     return refreshCard(btn.dataset.slot);
   }
+  if (act === 'refreshtgt') return refreshSessionTargets([btn.dataset.slot]);
+  if (act === 'refreshall') return refreshSessionTargets(S.slots.map((x) => x.id));
   if (act === 'combine') return openCombineSheet();
   if (act === 'skipday') {
     const { el, day, dayInfo } = S;
