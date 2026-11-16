@@ -1,7 +1,7 @@
 // Service worker: caches every app file so the app opens with no signal.
 // To ship an update, bump VERSION. Old caches are deleted on activate.
 // Bump this number every time you push a change. Phones then show "Update available".
-const VERSION = 'v23';
+const VERSION = 'v24';
 const CACHE = 'tracker-' + VERSION;
 
 const ASSETS = [

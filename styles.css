@@ -250,3 +250,13 @@ body.setup #tabbar { display: none; }
 .failhead { text-align: center; }
 .failbtn { height: 44px; border-radius: 12px; border: 1px solid var(--border); background: var(--raised); color: var(--muted); font-weight: 700; font-family: inherit; font-size: 15px; padding: 0; }
 .failbtn.on { background: rgba(251,191,36,.18); border-color: var(--warn); color: var(--warn); }
+
+/* Food judge */
+.judge { display: inline-block; font-size: 12px; font-weight: 600; padding: 2px 8px; margin-top: 4px; border-radius: 999px; border: 1px solid var(--border); background: var(--raised); color: var(--muted); }
+.judge.good { color: var(--ok); border-color: rgba(52,211,153,.5); background: rgba(52,211,153,.1); }
+.judge.ok { color: var(--accent-2); border-color: rgba(96,165,250,.5); background: rgba(59,130,246,.12); }
+.judge.poor { color: var(--warn); border-color: rgba(251,191,36,.5); background: rgba(251,191,36,.1); }
+.jbox { background: var(--raised); border: 1px solid var(--border); border-radius: 12px; padding: 10px 12px; margin-top: 12px; }
+.jbar { display: flex; height: 8px; border-radius: 999px; overflow: hidden; margin-top: 10px; }
+.jbar i { display: block; height: 100%; }
+.jnotes { margin: 10px 0 0; padding-left: 18px; font-size: 13px; color: var(--muted); line-height: 1.45; }

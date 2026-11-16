@@ -3385,6 +3385,83 @@ async function renderSummary(el, session) {
 return { render };
 })();
 
+/* ===== js/judge.js ===== */
+__m['js/judge.js'] = (function () {
+// Judges the macros of one food, or of a whole day, against his own daily targets.
+// Pure functions: no DOM and no database. Protein density is the main test, because the plan is built around protein.
+// tier: 'good' (green), 'ok' (blue), 'poor' (amber), 'none' (too small to judge).
+
+const r0 = (x) => Math.round(x);
+const r1 = (x) => Math.round(x * 10) / 10;
+
+// e: { kcal, protein, carbs, fat }   t: his targets { kcal, protein, carbs, fat }
+function judgeFood(e, t) {
+  const kcal = Number(e.kcal) || 0;
+  const p = Number(e.protein) || 0;
+  const c = Number(e.carbs) || 0;
+  const f = Number(e.fat) || 0;
+  if (kcal < 80) return { tier: 'none', label: 'Small item', notes: [], small: true, kcal, protein: p };
+
+  // Grams of protein per 100 kcal, for this food and for his whole day.
+  const goalDens = t.kcal > 0 ? (t.protein / t.kcal) * 100 : 7;
+  const dens = (p / kcal) * 100;
+  const ratio = goalDens > 0 ? dens / goalDens : 0;
+
+  // Split of calories, only when carbs or fat were entered.
+  const macroKcal = 4 * p + 4 * c + 9 * f;
+  const hasSplit = (c > 0 || f > 0) && macroKcal > 0;
+  const split = hasSplit ? { p: (4 * p / macroKcal) * 100, c: (4 * c / macroKcal) * 100, f: (9 * f / macroKcal) * 100 } : null;
+  const mismatch = hasSplit && Math.abs(macroKcal - kcal) / kcal > 0.2;
+  const fatGoalPct = t.kcal > 0 ? (t.fat * 9 / t.kcal) * 100 : 27;
+  const carbGoalPct = t.kcal > 0 ? (t.carbs * 4 / t.kcal) * 100 : 45;
+  const fatHeavy = !!split && split.f > Math.max(40, fatGoalPct * 1.5);
+  const carbHeavy = !!split && split.c > carbGoalPct * 1.3;
+
+  let tier;
+  let label;
+  if (ratio >= 1) {
+    tier = fatHeavy ? 'ok' : 'good';
+    label = fatHeavy ? 'High protein, fat heavy' : 'Protein strong';
+  } else if (ratio >= 0.6) {
+    tier = fatHeavy || carbHeavy ? 'poor' : 'ok';
+    label = fatHeavy ? 'Fat heavy' : carbHeavy ? 'Carb heavy' : (split ? 'Balanced' : 'Decent protein');
+  } else {
+    tier = 'poor';
+    label = fatHeavy ? 'Low protein, fat heavy' : carbHeavy ? 'Low protein, carb heavy' : 'Low protein';
+  }
+
+  const notes = [];
+  notes.push(`${r1(dens)} g protein per 100 kcal. Your daily goal works out to ${r1(goalDens)}.`);
+  if (ratio < 1) notes.push(`At your goal pace, ${r0(kcal)} kcal would carry about ${r0(goalDens * kcal / 100)} g protein. This has ${r0(p)} g.`);
+  if (t.kcal > 0 && t.protein > 0) notes.push(`That is ${r0((kcal / t.kcal) * 100)}% of your calories and ${r0((p / t.protein) * 100)}% of your protein goal.`);
+  if (t.kcal > 0 && kcal / t.kcal > 0.35) notes.push('A big share of the day in one entry.');
+  if (mismatch) notes.push(`Protein, carbs and fat add up to ${r0(macroKcal)} kcal but you entered ${r0(kcal)}. Check the numbers.`);
+  if (p === 0) notes.push('No protein entered. Edit it if this food has some.');
+
+  return { tier, label, notes, split, dens, goalDens, ratio, mismatch, fatHeavy, carbHeavy, small: false, kcal, protein: p };
+}
+
+// tot: { kcal, protein }   t: his targets for that day
+function judgeDay(tot, t) {
+  const kcalPct = t.kcal ? tot.kcal / t.kcal : 0;
+  const proteinPct = t.protein ? tot.protein / t.protein : 0;
+  let tier;
+  let label;
+  if (proteinPct >= 1) {
+    if (kcalPct > 1.1) { tier = 'ok'; label = 'Protein hit, calories over'; }
+    else if (kcalPct < 0.8) { tier = 'ok'; label = 'Protein hit, calories low'; }
+    else { tier = 'good'; label = 'On target'; }
+  } else if (proteinPct >= 0.85) {
+    tier = 'ok'; label = 'Close on protein';
+  } else {
+    tier = 'poor'; label = 'Protein short';
+  }
+  return { tier, label, kcalPct, proteinPct };
+}
+
+return { judgeFood, judgeDay };
+})();
+
 /* ===== js/screens/food.js ===== */
 __m['js/screens/food.js'] = (function () {
 // Food tab: calories and protein for the day.
@@ -3393,12 +3470,31 @@ const { targetFor } = __m['js/stats.js'];
 const { esc, fmtLong, openSheet, addDays, nowTime } = __m['js/ui.js'];
 const { getDays } = __m['js/seed.js'];
 const { maybeAutoAdjust, latestWeight } = __m['js/autotargets.js'];
+const { judgeFood, judgeDay } = __m['js/judge.js'];
 
 let viewDate = null; // lets you log for another day when you forgot
 let viewBase = null; // the real "today" when viewDate was set, so a new day resets the view
 
 const n0 = (v) => Math.round(v || 0);
 const num = (v) => { const x = parseFloat(String(v).replace(',', '.')); return Number.isNaN(x) ? null : x; };
+
+// Small pill with the verdict, and the full explanation box.
+function judgeBadge(j) {
+  return j.tier === 'none' ? '' : `<span class="judge ${j.tier}">${esc(j.label)}</span>`;
+}
+function judgeBox(j) {
+  if (j.small) return '<div class="jbox muted small">Small item, too few calories to judge.</div>';
+  const sp = j.split;
+  const bar = sp ? `
+    <div class="jbar"><i style="width:${sp.p}%;background:#3B82F6"></i><i style="width:${sp.c}%;background:#6B7FA8"></i><i style="width:${sp.f}%;background:#3E4F7A"></i></div>
+    <div class="legend"><span><i style="background:#3B82F6"></i>Protein ${n0(sp.p)}%</span><span><i style="background:#6B7FA8"></i>Carbs ${n0(sp.c)}%</span><span><i style="background:#3E4F7A"></i>Fat ${n0(sp.f)}%</span></div>` : '';
+  return `
+    <div class="jbox">
+      <div>${judgeBadge(j)}</div>
+      ${bar}
+      <ul class="jnotes">${j.notes.map((x) => `<li>${esc(x)}</li>`).join('')}</ul>
+    </div>`;
+}
 
 function ring(value, goal, label, unit) {
   const r = 46;
@@ -3420,7 +3516,8 @@ function ring(value, goal, label, unit) {
     </div>`;
 }
 
-async function render(el) {
+async function render(el, arg) {
+  if (arg === 'review') return renderReview(el);
   const today = dateStr();
   if (!viewDate || viewBase !== today) { viewDate = today; viewBase = today; }
   const date = viewDate;
@@ -3471,6 +3568,7 @@ async function render(el) {
           <label class="field">Fat g<input id="q-fat" inputmode="decimal"></label>
         </div>
       </details>
+      <div id="q-judge"></div>
       <label class="check-line"><input type="checkbox" id="q-preset"> Save as preset</label>
       <button class="btn" data-act="quick">Add</button>
     </div>
@@ -3491,11 +3589,12 @@ async function render(el) {
       <h3>${date === today ? "Today's" : 'Day'} entries</h3>
       ${entries.map((e) => `
         <button class="row tap" data-act="edit" data-id="${e.id}">
-          <div style="text-align:left"><div class="name">${esc(e.name || 'Food')}</div><div class="meta">${esc(e.time || '')}</div></div>
+          <div style="text-align:left"><div class="name">${esc(e.name || 'Food')}</div><div class="meta">${esc(e.time || '')}</div>${judgeBadge(judgeFood(e, target))}</div>
           <div class="scheme">${n0(e.kcal)} kcal, ${n0(e.protein)} g</div>
         </button>`).join('') || '<div class="muted small">Nothing logged yet.</div>'}
       ${yesterdayCount && !entries.length ? `<button class="btn secondary" data-act="repeat">Repeat yesterday (${yesterdayCount} entries)</button>` : ''}
     </div>
+    <a class="btn secondary" href="#/food/review" style="margin-bottom:12px">Review past foods</a>
 
     <details class="card targets">
       <summary>Eating tips</summary>
@@ -3527,6 +3626,16 @@ async function render(el) {
     if (!b) return;
     e.preventDefault();
     if (Date.now() - firedAt > 800) openEdit(b);
+  };
+
+  // Verdict preview while typing in Quick add, before anything is logged.
+  el.oninput = (e) => {
+    if (!e.target.id || !e.target.id.startsWith('q-')) return;
+    const v = (id) => num(el.querySelector(id).value);
+    const kcal = v('#q-kcal');
+    el.querySelector('#q-judge').innerHTML = kcal
+      ? judgeBox(judgeFood({ kcal, protein: v('#q-pro') || 0, carbs: v('#q-carb') || 0, fat: v('#q-fat') || 0 }, target))
+      : '';
   };
 
   el.onchange = async (e) => {
@@ -3609,12 +3718,17 @@ const read = (root) => ({
   fat: num(root.querySelector('#f-fat').value),
 });
 
-function editEntry(row, done) {
+async function editEntry(row, done) {
+  const t = await targetFor(row.date || dateStr());
   const { root, close } = openSheet(`
     <h2>Edit entry</h2>${fields(row)}
+    <div id="e-judge">${judgeBox(judgeFood(row, t))}</div>
     <button class="btn" data-act="save">Save</button>
     <button class="btn secondary" data-act="delete" style="color:#FBBF24">Delete entry</button>
     <button class="btn secondary" data-act="cancel">Cancel</button>`);
+  root.addEventListener('input', () => {
+    root.querySelector('#e-judge').innerHTML = judgeBox(judgeFood({ ...read(root) }, t));
+  });
   root.addEventListener('click', async (e) => {
     const act = e.target.closest('[data-act]')?.dataset.act;
     if (!act) return;
@@ -3669,6 +3783,132 @@ function editPreset(p, done, logAfter = false) {
       done();
     }
   });
+}
+
+// Review past foods: every food you have logged, judged, by food or by day.
+const rv = { mode: 'food', range: 30, sort: 'eaten', q: '' };
+const SORTS = [['eaten', 'Most eaten'], ['protein', 'Best protein'], ['kcal', 'Most calories']];
+const RANGES = [[7, '7 days'], [30, '30 days'], [0, 'All time']];
+
+async function renderReview(el) {
+  const today = dateStr();
+  const from = rv.range ? addDays(today, -(rv.range - 1)) : '';
+  const entries = (await getAll('foodEntries')).filter((e) => e.date >= from);
+  const targetRows = await getAll('nutritionTargets');
+  const cur = await targetFor(today, targetRows);
+
+  const seg = (list, key, val) => list.map(([v, l]) => `<button class="seg ${val === v ? 'on' : ''}" data-set="${key}" data-v="${v}">${l}</button>`).join('');
+  el.innerHTML = `
+    <a class="back" href="#/food">Food</a>
+    <div class="header"><h1>Review foods</h1></div>
+    <div class="small muted" style="margin:-4px 4px 12px">Each food is judged against your own daily goals, mainly protein per calorie.</div>
+    <div class="segs" style="margin-bottom:8px">${seg([['food', 'By food'], ['day', 'By day']], 'mode', rv.mode)}</div>
+    <div class="segs" style="margin-bottom:8px">${seg(RANGES, 'range', rv.range)}</div>
+    ${rv.mode === 'food' ? `
+      <div class="segs" style="margin-bottom:8px">${seg(SORTS, 'sort', rv.sort)}</div>
+      <input id="rv-q" type="search" placeholder="Search foods" value="${esc(rv.q)}" style="width:100%;margin-bottom:12px">` : '<div style="height:4px"></div>'}
+    <div class="card" id="rv-list"></div>`;
+
+  // Group by food name (ignoring capital letters), averaging the numbers for each food.
+  const groups = new Map();
+  for (const e of entries) {
+    const nm = (e.name || '').trim();
+    const key = nm.toLowerCase() || '(unnamed)';
+    const g = groups.get(key) || { key, name: nm || 'Unnamed food', n: 0, kcal: 0, protein: 0, carbs: 0, fat: 0, items: [] };
+    g.n += 1;
+    for (const k of ['kcal', 'protein', 'carbs', 'fat']) g[k] += e[k] || 0;
+    g.items.push(e);
+    groups.set(key, g);
+  }
+  const foods = [...groups.values()].map((g) => {
+    const avg = { kcal: g.kcal / g.n, protein: g.protein / g.n, carbs: g.carbs / g.n, fat: g.fat / g.n };
+    g.items.sort((a, b) => (b.date || '').localeCompare(a.date || '') || (b.time || '').localeCompare(a.time || ''));
+    return { ...g, avg, last: g.items[0].date, j: judgeFood(avg, cur) };
+  });
+
+  const byDate = new Map();
+  for (const e of entries) {
+    if (!byDate.has(e.date)) byDate.set(e.date, []);
+    byDate.get(e.date).push(e);
+  }
+  const days = [];
+  for (const [date, list] of byDate) {
+    const tot = list.reduce((a, e) => ({ kcal: a.kcal + (e.kcal || 0), protein: a.protein + (e.protein || 0) }), { kcal: 0, protein: 0 });
+    const t = await targetFor(date, targetRows);
+    days.push({ date, list, tot, j: judgeDay(tot, t) });
+  }
+  days.sort((a, b) => b.date.localeCompare(a.date));
+
+  const drawList = () => {
+    const box = el.querySelector('#rv-list');
+    if (rv.mode === 'day') {
+      box.innerHTML = days.map((d) => `
+        <button class="row tap" data-act="day" data-date="${d.date}">
+          <div style="text-align:left"><div class="name">${esc(fmtLong(d.date))}</div><div class="meta">${d.list.length} ${d.list.length === 1 ? 'entry' : 'entries'}</div><span class="judge ${d.j.tier}">${esc(d.j.label)}</span></div>
+          <div class="scheme">${n0(d.tot.kcal)} kcal, ${n0(d.tot.protein)} g</div>
+        </button>`).join('') || '<div class="muted small">Nothing logged in this range.</div>';
+      return;
+    }
+    const q = rv.q.trim().toLowerCase();
+    const dens = (f) => (f.avg.kcal >= 80 ? f.avg.protein / f.avg.kcal : -1);
+    const shown = foods.filter((f) => !q || f.name.toLowerCase().includes(q)).sort((a, b) => {
+      if (rv.sort === 'protein') return dens(b) - dens(a);
+      if (rv.sort === 'kcal') return b.avg.kcal - a.avg.kcal;
+      return b.n - a.n || b.last.localeCompare(a.last);
+    });
+    box.innerHTML = shown.map((f) => `
+      <button class="row tap" data-act="food" data-key="${esc(f.key)}">
+        <div style="text-align:left"><div class="name">${esc(f.name)}</div><div class="meta">${f.n} ${f.n === 1 ? 'time' : 'times'}, last ${esc(fmtLong(f.last))}</div>${judgeBadge(f.j)}</div>
+        <div class="scheme">${n0(f.avg.kcal)} kcal, ${n0(f.avg.protein)} g</div>
+      </button>`).join('') || '<div class="muted small">No foods match.</div>';
+  };
+  drawList();
+
+  el.oninput = (e) => {
+    if (e.target.id !== 'rv-q') return;
+    rv.q = e.target.value;
+    drawList();
+  };
+  el.onclick = async (e) => {
+    const sb = e.target.closest('[data-set]');
+    if (sb) {
+      const v = sb.dataset.v;
+      rv[sb.dataset.set] = sb.dataset.set === 'range' ? Number(v) : v;
+      return renderReview(el);
+    }
+    const btn = e.target.closest('[data-act]');
+    if (!btn) return;
+    if (btn.dataset.act === 'food') {
+      const f = foods.find((x) => x.key === btn.dataset.key);
+      const { root, close } = openSheet(`
+        <h2>${esc(f.name)}</h2>
+        <div class="muted small">Average of ${f.n} ${f.n === 1 ? 'entry' : 'entries'}: ${n0(f.avg.kcal)} kcal, ${n0(f.avg.protein)} g protein, ${n0(f.avg.carbs)} g carbs, ${n0(f.avg.fat)} g fat.</div>
+        ${judgeBox(f.j)}
+        <h3 style="margin-top:16px">Recent</h3>
+        ${f.items.slice(0, 10).map((x) => `<div class="row"><div class="name">${esc(fmtLong(x.date))}</div><div class="scheme">${n0(x.kcal)} kcal, ${n0(x.protein)} g</div></div>`).join('')}
+        <button class="btn secondary" data-act="close">Close</button>`);
+      root.addEventListener('click', (ev) => { if (ev.target.closest('[data-act="close"]')) close(); });
+      return;
+    }
+    if (btn.dataset.act === 'day') {
+      const d = days.find((x) => x.date === btn.dataset.date);
+      const t = await targetFor(d.date, targetRows);
+      const { root, close } = openSheet(`
+        <h2>${esc(fmtLong(d.date))}</h2>
+        <div class="muted small">${n0(d.tot.kcal)} of ${n0(t.kcal)} kcal, ${n0(d.tot.protein)} of ${n0(t.protein)} g protein.</div>
+        <div style="margin-top:8px"><span class="judge ${d.j.tier}">${esc(d.j.label)}</span></div>
+        <div style="margin-top:12px">
+          ${[...d.list].sort((a, b) => (a.time || '').localeCompare(b.time || '')).map((x) => `<div class="row"><div style="text-align:left"><div class="name">${esc(x.name || 'Food')}</div>${judgeBadge(judgeFood(x, t))}</div><div class="scheme">${n0(x.kcal)} kcal, ${n0(x.protein)} g</div></div>`).join('')}
+        </div>
+        <button class="btn" data-act="open">Open this day</button>
+        <button class="btn secondary" data-act="close">Close</button>`);
+      root.addEventListener('click', (ev) => {
+        const a = ev.target.closest('[data-act]')?.dataset.act;
+        if (a === 'close') close();
+        if (a === 'open') { close(); viewDate = d.date; viewBase = dateStr(); location.hash = '#/food'; }
+      });
+    }
+  };
 }
 
 return { render };
